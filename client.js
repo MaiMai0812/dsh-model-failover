@@ -66,6 +66,8 @@ window.__ModuleLoader__.load({
 .mf-kv { display: flex; flex-direction: column; gap: 2px; }
 .mf-kv > b { font-weight: 600; }
 .mf-row { display: flex; align-items: center; gap: 10px; padding: 7px 8px; border-radius: 8px; }
+/* 队列行外面再包一层竖排容器：右键弹出来的「上下文窗口」小窗要长在行下面。 */
+.mf-qrow { display: flex; flex-direction: column; }
 .mf-row:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
 /* 排序靠拖：这一行整体都是把手。左边那个 ⠿ 只是把「可以拖」这件事说出口。 */
 .mf-row[draggable='true'] { cursor: grab; }
@@ -74,6 +76,12 @@ window.__ModuleLoader__.load({
 /* 正被拖走的那一行淡下去，落点那一行顶上画一条线。 */
 .mf-row.mf-drag-src { opacity: .4; }
 .mf-row.mf-drop { box-shadow: inset 0 2px 0 currentColor; }
+/* 右键弹窗：两行只读信息 + 一行编辑器 + 一句提示。 */
+.mf-window { display: flex; flex-direction: column; gap: 6px; margin: 0 8px 6px; padding: 8px 10px; border-radius: 8px; background: color-mix(in srgb, currentColor 5%, transparent); font-size: 12px; }
+.mf-window-row { display: flex; gap: 8px; align-items: baseline; }
+.mf-window-label { flex: none; opacity: .55; }
+.mf-window-value { min-width: 0; font-variant-numeric: tabular-nums; }
+.mf-window-edit { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .mf-idx { width: 20px; text-align: right; opacity: .5; font-variant-numeric: tabular-nums; }
 .mf-main { flex: 1; min-width: 0; }
 .mf-name { display: flex; align-items: center; font-weight: 500; }
@@ -209,13 +217,21 @@ window.__ModuleLoader__.load({
         failCountHint: '今天这个模型一共失败了几次（所有会话合计）',
         goodCountHint: '今天这个模型成功了几次（所有会话合计）',
         queueHint:
-          '靠前的优先使用。按住某一行拖到新位置就能改顺序，✕ 移出队列；右栏给每个模型挑它这一轮用的思考强度，档位就是平时直接选它时能选的那几档。',
+          '靠前的优先使用。按住某一行拖到新位置就能改顺序，✕ 移出队列；右栏给每个模型挑它这一轮用的思考强度，档位就是平时直接选它时能选的那几档。右键点某一行可以看/改它的上下文窗口。',
         effortDefault: '默认档位',
         effortUnknown: '档位待扫描',
         effortNone: '无档位',
         effortHint: '「默认档位」＝这个模型平时的档位（不指定）；档位表由模型自己提供。',
         queueEmpty: '队列是空的。从下面挑一个模型加进来，或者点「重新扫描」。',
         gripHint: '按住拖动，改这条队列的顺序',
+        windowSize: '上下文窗口',
+        windowCompressAt: '压缩触发点',
+        windowUnknown: '未知',
+        windowPlaceholder: '覆盖窗口大小…',
+        windowSave: '保存',
+        windowClear: '恢复默认',
+        windowHint:
+          '覆盖值只对这一行生效：接力对外声明的是队首候选的窗口，每个候选按自己的窗口跑。压缩触发点 = 窗口 × 0.8（宿主默认比例）。',
         remove: '移出队列',
         addModel: '从已接入的模型里添加…',
         add: '添加',
@@ -367,13 +383,21 @@ window.__ModuleLoader__.load({
         failCountHint: 'How many times this model failed today (all conversations)',
         goodCountHint: 'How many times this model succeeded today (all conversations)',
         queueHint:
-          'Earlier entries are tried first. Drag a row to a new position to reorder, ✕ to remove; the right column picks the reasoning effort each model uses — the same levels you get when you pick that model directly.',
+          'Earlier entries are tried first. Drag a row to a new position to reorder, ✕ to remove; the right column picks the reasoning effort each model uses — the same levels you get when you pick that model directly. Right-click a row to view or change its context window.',
         effortDefault: 'Default effort',
         effortUnknown: 'Effort unknown',
         effortNone: 'No effort',
         effortHint: '"Default effort" keeps the model’s own level (nothing is specified); the levels come from the model itself.',
         queueEmpty: 'The queue is empty. Add a model below, or press Rescan.',
         gripHint: 'Drag to reorder this queue',
+        windowSize: 'Context window',
+        windowCompressAt: 'Compaction trigger',
+        windowUnknown: 'Unknown',
+        windowPlaceholder: 'Override window…',
+        windowSave: 'Save',
+        windowClear: 'Reset to default',
+        windowHint:
+          'The override applies to this row only: the relay advertises the head candidate’s window, and each candidate runs at its own window. Compaction trigger = window × 0.8 (host default ratio).',
         remove: 'Remove',
         addModel: 'Add a connected model…',
         add: 'Add',
@@ -547,6 +571,12 @@ window.__ModuleLoader__.load({
     function stamp(ts) {
       const at = new Date(ts)
       return `${pad(at.getMonth() + 1)}-${pad(at.getDate())} ${clock(ts)}`
+    }
+
+    /** 上下文窗口的展示格式：`128,000`（千分位），未知给 `—`。 */
+    function formatWindow(n) {
+      if (!Number.isFinite(n) || n <= 0) return '—'
+      return Math.round(n).toLocaleString('en-US')
     }
 
     /**
@@ -728,6 +758,8 @@ window.__ModuleLoader__.load({
       const [probingId, setProbingId] = useState('')
       /** 上一次导入/导出的结果（空串 = 还没导过）。 */
       const [importNote, setImportNote] = useState('')
+      /** 右键弹窗正开着的是哪一行（null = 没开）。 */
+      const [windowFor, setWindowFor] = useState(null)
       const [, setTick] = useState(0)
       const alive = useRef(true)
 
@@ -894,6 +926,23 @@ window.__ModuleLoader__.load({
           if (at !== index) return item
           if (value === '') return { provider: item.provider, model: item.model }
           return { provider: item.provider, model: item.model, reasoningEffort: value }
+        })
+        mutateOrder(next)
+      }, [order, mutateOrder])
+
+      /**
+       * 给队列里某一项设置上下文窗口覆盖；`''` 表示「不覆盖」（用模型自己的）。
+       *
+       * 和 `setEffort` 一样显式重建，只留 provider/model/reasoningEffort/contextWindow
+       * 四个键，避免以后加字段时留下幽灵值。
+       */
+      const setWindow = useCallback((index, value) => {
+        const next = order.map((item, at) => {
+          if (at !== index) return item
+          const base = { provider: item.provider, model: item.model }
+          if (item.reasoningEffort !== undefined) base.reasoningEffort = item.reasoningEffort
+          if (value === '') return base
+          return { ...base, contextWindow: value }
         })
         mutateOrder(next)
       }, [order, mutateOrder])
@@ -1315,95 +1364,111 @@ window.__ModuleLoader__.load({
                 dragging.from === index ? 'mf-drag-src' : '',
                 dragging.over === index && dragging.from !== index ? 'mf-drop' : '',
               ].filter((part) => part !== '').join(' ')
-              return div({
-                className,
-                key,
-                'data-role': 'queue-row',
-                'data-index': String(index),
-                // 整行都是把手 —— 用户就是要把「框框」拖着走。busy 时不给拖，
-                // 免得和正在提交的那次写回打架。
-                draggable: busy ? undefined : true,
-                onDragStart: (event) => {
-                  // 从下拉框、按钮、输入框上按下时不算拖行：那几下是在操作控件。
-                  const tag = String(event?.target?.tagName ?? '').toUpperCase()
-                  if (tag === 'SELECT' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'OPTION') {
+              return div({ className: 'mf-qrow', key },
+                div({
+                  className,
+                  'data-role': 'queue-row',
+                  'data-index': String(index),
+                  // 整行都是把手 —— 用户就是要把「框框」拖着走。busy 时不给拖，
+                  // 免得和正在提交的那次写回打架。
+                  draggable: busy ? undefined : true,
+                  // 右键弹「上下文窗口」小窗；再点一次同一行把它关掉。
+                  onContextMenu: (event) => {
                     event?.preventDefault?.()
-                    return
-                  }
-                  dragFromRef.current = index
-                  setDrag({ from: index, over: index })
-                  if (event?.dataTransfer !== undefined) {
-                    event.dataTransfer.effectAllowed = 'move'
-                    // 有些浏览器非要有数据才肯开始拖；内容本身不用，索引在 ref 里。
-                    event.dataTransfer.setData?.('text/plain', String(index))
-                  }
+                    setWindowFor((previous) => (previous === index ? null : index))
+                  },
+                  onDragStart: (event) => {
+                    // 从下拉框、按钮、输入框上按下时不算拖行：那几下是在操作控件。
+                    const tag = String(event?.target?.tagName ?? '').toUpperCase()
+                    if (tag === 'SELECT' || tag === 'BUTTON' || tag === 'INPUT' || tag === 'OPTION') {
+                      event?.preventDefault?.()
+                      return
+                    }
+                    dragFromRef.current = index
+                    setDrag({ from: index, over: index })
+                    if (event?.dataTransfer !== undefined) {
+                      event.dataTransfer.effectAllowed = 'move'
+                      // 有些浏览器非要有数据才肯开始拖；内容本身不用，索引在 ref 里。
+                      event.dataTransfer.setData?.('text/plain', String(index))
+                    }
+                  },
+                  onDragOver: (event) => {
+                    if (dragFromRef.current < 0) return
+                    // 不 preventDefault 浏览器就当这里不接受拖放，drop 根本不会来。
+                    event?.preventDefault?.()
+                    if (event?.dataTransfer !== undefined) event.dataTransfer.dropEffect = 'move'
+                    setDrag((previous) => (previous === null || previous.over === index ? previous : { ...previous, over: index }))
+                  },
+                  onDragLeave: () => {
+                    setDrag((previous) => (
+                      previous === null || previous.over !== index ? previous : { ...previous, over: previous.from }
+                    ))
+                  },
+                  onDrop: (event) => {
+                    event?.preventDefault?.()
+                    const from = dragFromRef.current
+                    stopDrag()
+                    reorder(from, index)
+                  },
+                  onDragEnd: stopDrag,
                 },
-                onDragOver: (event) => {
-                  if (dragFromRef.current < 0) return
-                  // 不 preventDefault 浏览器就当这里不接受拖放，drop 根本不会来。
-                  event?.preventDefault?.()
-                  if (event?.dataTransfer !== undefined) event.dataTransfer.dropEffect = 'move'
-                  setDrag((previous) => (previous === null || previous.over === index ? previous : { ...previous, over: index }))
-                },
-                onDragLeave: () => {
-                  setDrag((previous) => (
-                    previous === null || previous.over !== index ? previous : { ...previous, over: previous.from }
-                  ))
-                },
-                onDrop: (event) => {
-                  event?.preventDefault?.()
-                  const from = dragFromRef.current
-                  stopDrag()
-                  reorder(from, index)
-                },
-                onDragEnd: stopDrag,
-              },
-                span({ className: 'mf-grip', title: t('gripHint'), 'data-role': 'queue-grip' }, '⠿'),
-                span({ className: 'mf-idx' }, String(index + 1)),
-                // 今天这个模型在全机器上失败了几次、成了几次。红的是失败、绿的是
-                // 成功 —— 它是**统计**，不是隔离状态：隔离按「会话 × 模板」算，
-                // 一行一个模型答不了「在我这个会话里能不能用」。
-                span({ className: 'mf-tally' },
-                  span({ className: 'mf-fail', title: t('failCountHint') }, String(tally?.fail ?? 0)),
-                  span({ className: 'mf-good', title: t('goodCountHint') }, String(tally?.ok ?? 0)),
-                ),
-                div({ className: 'mf-main' },
-                  div({ className: 'mf-name' },
-                    span({ className: 'mf-name-text' }, hit?.name ?? item.model),
-                    // 试连接的结论紧跟在名字后面，一眼看清哪个通、哪个不通。
-                    probeRow === undefined
-                      ? null
-                      : span({
-                          className: `mf-probe mf-probe-${probeRow.state}`,
-                          title: probeHint(probeRow),
-                          'data-role': 'probe',
-                        }, probeText(probeRow)),
+                  span({ className: 'mf-grip', title: t('gripHint'), 'data-role': 'queue-grip' }, '⠿'),
+                  span({ className: 'mf-idx' }, String(index + 1)),
+                  // 今天这个模型在全机器上失败了几次、成了几次。红的是失败、绿的是
+                  // 成功 —— 它是**统计**，不是隔离状态：隔离按「会话 × 模板」算，
+                  // 一行一个模型答不了「在我这个会话里能不能用」。
+                  span({ className: 'mf-tally' },
+                    span({ className: 'mf-fail', title: t('failCountHint') }, String(tally?.fail ?? 0)),
+                    span({ className: 'mf-good', title: t('goodCountHint') }, String(tally?.ok ?? 0)),
                   ),
-                  div({ className: 'mf-sub' }, `${hit?.providerName ?? item.provider} · ${item.model}`),
-                ),
-                // 思考强度：档位表来自模型自己（resolveModelInfo 的 reasoning），
-                // 所以画出来的就是用户在模型设置页直接选它时看到的那几档。
-                // 还没问到档位表时先给一个禁用态，不要凭空造几个档位出来。
-                hit === undefined || hit.effortsKnown !== true
-                  ? h('select', { className: 'mf-effort', disabled: true, title: t('effortHint'), value: '' },
-                      h('option', { value: '' }, t('effortUnknown')))
-                  : (hit.efforts.length === 0
-                      ? span({ className: 'mf-effort-none', title: t('effortHint') }, t('effortNone'))
-                      : h('select', {
-                          className: 'mf-effort',
-                          title: t('effortHint'),
-                          value: item.reasoningEffort ?? '',
-                          disabled: busy,
-                          onChange: (event) => setEffort(index, event.target.value),
-                        },
-                          h('option', { value: '' }, t('effortDefault')),
-                          ...hit.efforts.map((effort) => h('option', { key: effort.id, value: effort.id },
-                            effort.name,
+                  div({ className: 'mf-main' },
+                    div({ className: 'mf-name' },
+                      span({ className: 'mf-name-text' }, hit?.name ?? item.model),
+                      // 试连接的结论紧跟在名字后面，一眼看清哪个通、哪个不通。
+                      probeRow === undefined
+                        ? null
+                        : span({
+                            className: `mf-probe mf-probe-${probeRow.state}`,
+                            title: probeHint(probeRow),
+                            'data-role': 'probe',
+                          }, probeText(probeRow)),
+                    ),
+                    div({ className: 'mf-sub' }, `${hit?.providerName ?? item.provider} · ${item.model}`),
+                  ),
+                  // 思考强度：档位表来自模型自己（resolveModelInfo 的 reasoning），
+                  // 所以画出来的就是用户在模型设置页直接选它时看到的那几档。
+                  // 还没问到档位表时先给一个禁用态，不要凭空造几个档位出来。
+                  hit === undefined || hit.effortsKnown !== true
+                    ? h('select', { className: 'mf-effort', disabled: true, title: t('effortHint'), value: '' },
+                        h('option', { value: '' }, t('effortUnknown')))
+                    : (hit.efforts.length === 0
+                        ? span({ className: 'mf-effort-none', title: t('effortHint') }, t('effortNone'))
+                        : h('select', {
+                            className: 'mf-effort',
+                            title: t('effortHint'),
+                            value: item.reasoningEffort ?? '',
+                            disabled: busy,
+                            onChange: (event) => setEffort(index, event.target.value),
+                          },
+                            h('option', { value: '' }, t('effortDefault')),
+                            ...hit.efforts.map((effort) => h('option', { key: effort.id, value: effort.id },
+                              effort.name,
+                            )),
                           )),
-                        )),
-                div({ className: 'mf-actions' },
-                  h('button', { type: 'button', className: 'mf-btn mf-icon', 'data-role': 'queue-remove', title: t('remove'), disabled: busy, onClick: () => removeAt(index) }, '✕'),
+                  div({ className: 'mf-actions' },
+                    h('button', { type: 'button', className: 'mf-btn mf-icon', 'data-role': 'queue-remove', title: t('remove'), disabled: busy, onClick: () => removeAt(index) }, '✕'),
+                  ),
                 ),
+                windowFor === index
+                  ? h(WindowEditor, {
+                      value: item.contextWindow === undefined ? '' : String(item.contextWindow),
+                      own: hit?.contextWindow,
+                      t,
+                      busy,
+                      onSave: (value) => setWindow(index, value),
+                      onClose: () => setWindowFor(null),
+                    })
+                  : null,
               )
             }),
             order.length === 0 ? div({ className: 'mf-empty' }, t('queueEmpty')) : null,
@@ -1652,6 +1717,56 @@ window.__ModuleLoader__.load({
         onBlur: commit,
         onKeyDown: (event) => { if (event.key === 'Enter') event.currentTarget.blur() },
       })
+    }
+
+    /**
+     * 队列行右键弹出来的「上下文窗口」小窗。
+     *
+     * 显示这个模型当前的上下文窗口（覆盖值优先，否则模型自己的），以及宿主
+     * 默认的压缩触发点（窗口 × 0.8）；下面就是编辑器：改覆盖值、或清掉覆盖
+     * 回到模型自己的窗口。宿主设置页的「模型 → 高级」里也能改模型自己的
+     * 窗口，但那条路由（模型接力）的窗口是插件对外声明的，所以覆盖值放这里。
+     */
+    function WindowEditor({ value, own, t, busy, onSave, onClose }) {
+      const [draft, setDraft] = useState(value === '' ? '' : String(value))
+      const effective = draft === '' ? own : Number(draft)
+      const submit = () => {
+        const trimmed = String(draft ?? '').trim()
+        if (trimmed === '') { onSave(''); return }
+        const n = Number(trimmed)
+        // 非法输入（负数、小数、NaN）不提交也不关窗，让用户自己改。
+        if (!Number.isInteger(n) || n <= 0) return
+        onSave(n)
+      }
+      return div({ className: 'mf-window', 'data-role': 'queue-window' },
+        div({ className: 'mf-window-row' },
+          span({ className: 'mf-window-label' }, t('windowSize')),
+          span({ className: 'mf-window-value', 'data-role': 'window-value' }, formatWindow(effective)),
+        ),
+        div({ className: 'mf-window-row' },
+          span({ className: 'mf-window-label' }, t('windowCompressAt')),
+          span({ className: 'mf-window-value' },
+            effective === undefined ? t('windowUnknown') : formatWindow(Math.floor(effective * 0.8))),
+        ),
+        div({ className: 'mf-window-edit' },
+          h('input', {
+            type: 'number',
+            className: 'mf-num',
+            min: '1',
+            step: '1024',
+            'data-role': 'window-input',
+            value: draft,
+            disabled: busy,
+            placeholder: t('windowPlaceholder'),
+            onChange: (event) => setDraft(event.target.value),
+            onKeyDown: (event) => { if (event.key === 'Enter') submit() },
+          }),
+          h('button', { type: 'button', className: 'mf-btn', 'data-role': 'window-save', disabled: busy, onClick: submit }, t('windowSave')),
+          h('button', { type: 'button', className: 'mf-btn', 'data-role': 'window-clear', disabled: busy, onClick: () => { setDraft(''); onSave('') } }, t('windowClear')),
+          h('button', { type: 'button', className: 'mf-btn mf-icon', 'data-role': 'window-close', title: t('close'), onClick: onClose }, '✕'),
+        ),
+        div({ className: 'mf-note' }, t('windowHint')),
+      )
     }
 
     /**

@@ -337,6 +337,7 @@ const initialState = () => ({
     {
       provider: 'alpha', providerName: '硅基流动', model: 'one', name: 'Alpha One', description: '',
       efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'low', effortsKnown: true,
+      contextWindow: 128_000,
     },
     { provider: 'beta', providerName: 'Code99', model: 'one', name: 'Beta One', description: '', efforts: [], effortsKnown: true },
     { provider: 'gamma', providerName: 'FutureHub', model: 'two', name: 'Gamma Two', description: '', efforts: [], effortsKnown: false },
@@ -1557,6 +1558,94 @@ await check('从下拉框 / 按钮上按下不算拖行，拖完必须收干净'
     0,
     '没放下就别写回',
   )
+})
+
+// 右键弹窗：队列行上右键，摊出「上下文窗口」小窗；再点一次同一行收起。
+// 注意：前面的拖拽测试会把队列顺序改掉（现在是 [beta, alpha, gamma]），
+// 所以这里不写死下标，按 provider/model 从当前顺序里找行。
+const windowEditor = () => runtime.nodes.find((node) => node.props['data-role'] === 'queue-window')
+const windowInput = () => runtime.find((node) => node.props['data-role'] === 'window-input')
+const windowValue = () => runtime.find((node) => node.props['data-role'] === 'window-value')
+const contextMenu = (row) => row.props.onContextMenu({ preventDefault() {} })
+const rowIndexOf = (provider, model) => current.settings.templates[0].order.findIndex(
+  (item) => item.provider === provider && item.model === model,
+)
+
+await check('右键队列行：弹出上下文窗口小窗，显示模型自己的窗口', async () => {
+  assert.equal(windowEditor(), undefined, '默认没有弹窗')
+
+  const alpha = rowIndexOf('alpha', 'one')
+  contextMenu(queueRows()[alpha])
+  await runtime.mount(page(props))
+  assert.ok(windowEditor() !== undefined, '右键第一行后弹出小窗')
+  // 模型自己的窗口（catalog.contextWindow = 128k），千分位格式化。
+  assert.equal(windowValue().text, '128,000')
+
+  // 再点一次同一行：收起。
+  contextMenu(queueRows()[alpha])
+  await runtime.mount(page(props))
+  assert.equal(windowEditor(), undefined, '再点一次同一行收起')
+})
+
+await check('右键弹窗：保存一个覆盖值，POST 里带 contextWindow', async () => {
+  const before = requests.length
+  const beta = rowIndexOf('beta', 'one')
+  const alpha = rowIndexOf('alpha', 'one')
+  contextMenu(queueRows()[beta]) // beta 行：catalog 里没有 contextWindow → 显示未知
+  await runtime.mount(page(props))
+  assert.ok(windowEditor() !== undefined)
+  assert.equal(windowValue().text, '—', '模型自己没窗口时显示未知')
+
+  // 填一个覆盖值并保存。
+  windowInput().props.onChange({ target: { value: '65536' } })
+  await runtime.mount(page(props))
+  runtime.find((node) => node.props['data-role'] === 'window-save').props.onClick()
+  await runtime.mount(page(props))
+
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.equal(posts.length, 1)
+  assert.equal(posts[0].body.templates[0].order[beta].contextWindow, 65536, '覆盖值写进队列行')
+  assert.equal('contextWindow' in posts[0].body.templates[0].order[alpha], false, '没动的行不带覆盖')
+  // 保存后弹窗还开着（值已生效），方便继续调。
+  assert.ok(windowEditor() !== undefined, '保存后小窗不自动关')
+  // 收尾：关掉，别让下一个用例以为它还开着。
+  runtime.find((node) => node.props['data-role'] === 'window-close').props.onClick()
+  await runtime.mount(page(props))
+})
+
+await check('右键弹窗：恢复默认把覆盖值摘掉，非法输入不提交', async () => {
+  const before = requests.length
+  const beta = rowIndexOf('beta', 'one')
+  // 上一轮给 beta 存了 65536，现在把它清掉。
+  contextMenu(queueRows()[beta])
+  await runtime.mount(page(props))
+  runtime.find((node) => node.props['data-role'] === 'window-clear').props.onClick()
+  await runtime.mount(page(props))
+
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.equal(posts.length, 1)
+  assert.equal('contextWindow' in posts[0].body.templates[0].order[beta], false, '恢复默认后不再带覆盖')
+
+  // 非法输入（负数）不提交也不关窗。
+  const before2 = requests.length
+  windowInput().props.onChange({ target: { value: '-5' } })
+  await runtime.mount(page(props))
+  runtime.find((node) => node.props['data-role'] === 'window-save').props.onClick()
+  await runtime.mount(page(props))
+  assert.equal(requests.slice(before2).filter((row) => row.method === 'POST').length, 0, '负数不该提交')
+  assert.ok(windowEditor() !== undefined, '非法输入时小窗还开着')
+})
+
+await check('右键弹窗：✕ 关掉小窗，不写回设置', async () => {
+  const before = requests.length
+  const alpha = rowIndexOf('alpha', 'one')
+  contextMenu(queueRows()[alpha])
+  await runtime.mount(page(props))
+  assert.ok(windowEditor() !== undefined)
+  runtime.find((node) => node.props['data-role'] === 'window-close').props.onClick()
+  await runtime.mount(page(props))
+  assert.equal(windowEditor(), undefined, '✕ 收起小窗')
+  assert.equal(requests.slice(before).filter((row) => row.method === 'POST').length, 0, '关窗不写回')
 })
 
 await check('✕ 把这一行移出队列', async () => {

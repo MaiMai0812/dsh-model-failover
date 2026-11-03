@@ -126,7 +126,16 @@ function normalizeCandidates(raw) {
       typeof item.reasoningEffort === 'string' && item.reasoningEffort.trim() !== ''
         ? item.reasoningEffort.trim()
         : undefined
-    order.push(reasoningEffort === undefined ? { provider, model } : { provider, model, reasoningEffort })
+    // 每个候选也可以覆盖自己的上下文窗口（设置页右键弹窗里改）。合法值是正整数；
+    // 其余一律当没写，让「模型自己的窗口」说了算。
+    const contextWindow =
+      Number.isInteger(item.contextWindow) && item.contextWindow > 0
+        ? item.contextWindow
+        : undefined
+    const entry = { provider, model }
+    if (reasoningEffort !== undefined) entry.reasoningEffort = reasoningEffort
+    if (contextWindow !== undefined) entry.contextWindow = contextWindow
+    order.push(entry)
   }
   return order
 }
@@ -579,6 +588,9 @@ export function apply(ctx, _config) {
           efforts: known?.efforts ?? [],
           defaultEffort: known?.defaultEffort,
           effortsKnown: catalog.reasoningKnown(row.provider, row.model),
+          // 模型自己的上下文窗口（没问到就 undefined）。设置页右键弹窗要拿它
+          // 显示「上下文窗口 xxx」，并作为每行覆盖值的默认参照。
+          contextWindow: catalog.contextWindow(row.provider, row.model),
         }
       }),
       catalogErrors: catalog.errors,

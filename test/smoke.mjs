@@ -1046,7 +1046,7 @@ await check('适配器契约：providerInfo / listModels / resolveModel / retryP
   const info = await h.adapter.resolveModel(ROUTE, 'default')
   assert.equal(info.id, 'default')
   assert.equal(info.name, '默认模板')
-  assert.equal(info.context.contextWindow, 8192, '应声明队列里最窄的上下文窗口')
+  assert.equal(info.context.contextWindow, 8192, '应声明队列里第一个候选的上下文窗口')
   // 这条路由**一个档位都不声明**：它背后是一串各有各档位表的模型，报并集就是
   // 说谎 —— 报过的档位在队列变动（或目录还没扫完）之后失效，宿主会拿
   // UNSUPPORTED_REASONING_EFFORT 把整轮拒掉。档位整体缩回队列内部，见 `#effortFor`。
@@ -1064,6 +1064,43 @@ await check('适配器契约：providerInfo / listModels / resolveModel / retryP
   const prepared = await h.adapter.prepareCall(ROUTE, 'default')
   assert.equal(prepared.model.id, 'default')
   assert.equal(typeof prepared.stream, 'function')
+})
+
+// 12.5 · 上下文窗口：对外声明队首候选的窗口（不是全队最窄），每行可覆盖
+await check('上下文窗口：对外声明第一个候选的窗口，行内覆盖优先，不再被最窄拖低', async () => {
+  const h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one' }, // 128k
+      { provider: 'beta', model: 'one' }, // 32k —— 最窄
+      { provider: 'gamma', model: 'one', contextWindow: 16_384 }, // 行内覆盖
+    ],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), ok('好了')],
+      [routeKey('beta', 'one'), ok('好了')],
+      [routeKey('gamma', 'one'), ok('好了')],
+    ]),
+  })
+  // 目录里 alpha=128k、beta=32k；gamma 没被问到，但行内覆盖给了 16k。
+  h.llm.resolveModelInfo = async (provider, model) => (model === 'one'
+    ? { provider, model, context: { contextWindow: provider === 'alpha' ? 128_000 : 32_000 } }
+    : undefined)
+  // 宿主改口后要忘掉旧答案才会重问（见「asked 不是永久结论」那条）。
+  h.catalog.forgetAsked()
+  await h.catalog.refresh()
+  await h.catalog.fillModelFacts()
+
+  // headContextWindow：第一个候选优先，行内覆盖优先于目录。
+  const order = h.settings.get().templates[0].order
+  assert.equal(h.catalog.headContextWindow(order), 128_000, '队首候选的窗口')
+  assert.equal(h.catalog.narrowestContextWindow(order), 32_000, '最窄的窗口（保留原语义）')
+
+  // 行内覆盖：把队首的 alpha 盖上 16k，对外声明就跟着变。
+  const withOverride = [{ provider: 'alpha', model: 'one', contextWindow: 16_384 }, ...order.slice(1)]
+  assert.equal(h.catalog.headContextWindow(withOverride), 16_384, '行内覆盖优先于目录')
+
+  // resolveModel 用 head 而不是 narrowest。
+  const info = await h.adapter.resolveModel(ROUTE, 'default')
+  assert.equal(info.context.contextWindow, 128_000, '对外声明队首候选的窗口')
 })
 
 // 12 · 思考强度：每个候选按自己的档位表收档位
