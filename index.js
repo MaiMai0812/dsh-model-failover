@@ -30,6 +30,7 @@ import {
   DEFAULT_SETTINGS,
   DEFAULT_TEMPLATE_ID,
   DEFAULT_TEMPLATE_NAME,
+  MAX_COOLDOWN_SEC,
   MAX_IDLE_TIMEOUT_SEC,
   MAX_SAME_MODEL_RETRIES,
   MAX_TEMPLATE_CANDIDATES,
@@ -41,6 +42,7 @@ import {
   routeKey,
   splitKey,
 } from './lib/constants.js'
+import { Cooldowns } from './lib/cooldown.js'
 import { DailyHealth, nextResetAt, normalizeState } from './lib/health.js'
 import { TurnNotes } from './lib/notes.js'
 import { JsonFile, dataDir, removeFile } from './lib/store.js'
@@ -240,6 +242,12 @@ export function normalizeSettings(raw) {
       ? Math.min(source.idleTimeoutSec, IDLE_TIMEOUT_HARD_LIMIT)
       : DEFAULT_SETTINGS.idleTimeoutSec
 
+  // 0 同样有意义：不冷却，限流照旧走「隔离到明天」那条老路。
+  const cooldownSec =
+    Number.isInteger(source.cooldownSec) && source.cooldownSec >= 0
+      ? Math.min(source.cooldownSec, MAX_COOLDOWN_SEC)
+      : DEFAULT_SETTINGS.cooldownSec
+
   return {
     enabled: source.enabled !== false,
     bootstrapped: source.bootstrapped === true,
@@ -261,6 +269,7 @@ export function normalizeSettings(raw) {
     autoContinueMaxTokensLimit,
     continueDelaySec,
     idleTimeoutSec,
+    cooldownSec,
     keepEventLog: source.keepEventLog !== false,
     eventLogLimit,
     // 会话页「隔离队列」显示谁：子智能体的会话默认不显示（那是委托出去的一次
@@ -353,6 +362,15 @@ export function apply(ctx, _config) {
    */
   const notes = new TurnNotes()
 
+  /**
+   * 限流冷却表（lib/cooldown.js）。
+   *
+   * 只在内存里：冷却最多活几分钟，重启一次就当没事发生，没有落盘的价值。
+   * 建在这里而不是适配器内部，是因为设置页 API 要读它（把「还要等多久」显示
+   * 在队列行上），而 `/reset` 也要能把它一起清掉。
+   */
+  const cooldowns = new Cooldowns({ now: () => Date.now() })
+
   /** 把 `provider / model` 换成人看的名字；清单里查不到就原样回落。 */
   const labelOf = (provider, model) => {
     const hit = catalog.cached().find((row) => row.provider === provider && row.model === model)
@@ -365,6 +383,7 @@ export function apply(ctx, _config) {
     health,
     catalog,
     notes,
+    cooldowns,
     log: {
       warn: (message) => logger.warn?.(`model-failover: ${message}`),
       push: (event) => pushEvent(event),
@@ -600,6 +619,9 @@ export function apply(ctx, _config) {
       catalogProviders: catalog.providers,
       quarantined: view.quarantined.map(decorate),
       good: view.good.map(decorate),
+      // 正在限流冷却里的模型（内存态，不分会话）。队列行据此显示「还要等 N 秒」，
+      // 免得用户看到排第一的模型莫名其妙被跳过 —— 它只是被限流了，没坏。
+      cooling: cooldowns.view().map(decorate),
       // 每模型当天的失败/成功次数（所有会话、所有模板合计）——设置页队列前面
       // 那对红绿数字就是它。
       counts: view.counts,
@@ -630,6 +652,7 @@ export function apply(ctx, _config) {
     if ('autoContinueMaxTokensLimit' in patch) next.autoContinueMaxTokensLimit = patch.autoContinueMaxTokensLimit
     if ('continueDelaySec' in patch) next.continueDelaySec = patch.continueDelaySec
     if ('idleTimeoutSec' in patch) next.idleTimeoutSec = patch.idleTimeoutSec
+    if ('cooldownSec' in patch) next.cooldownSec = patch.cooldownSec
     if ('keepEventLog' in patch) next.keepEventLog = patch.keepEventLog !== false
     if ('eventLogLimit' in patch) next.eventLogLimit = patch.eventLogLimit
     if ('showSubagentSessions' in patch) next.showSubagentSessions = patch.showSubagentSessions === true
@@ -766,6 +789,9 @@ export function apply(ctx, _config) {
           const settings = settingsFile.get()
           const cleared = health.clearSession(now, settings.resetHour, sessionId)
           stateFile.flush()
+          // 冷却一起解掉：用户点这个按钮的意思是「现在就重新试它」，
+          // 留着「还要再等 40 秒」只会让他点了没反应。
+          cooldowns.clear()
           pushEvent({
             at: now,
             kind: 'reset',
@@ -785,6 +811,7 @@ export function apply(ctx, _config) {
         const view = health.view(now, settings.resetHour)
         health.clear(now, settings.resetHour)
         stateFile.flush()
+        cooldowns.clear()
         pushEvent({ at: now, kind: 'reset', cleared: view.quarantined.length, day: view.day })
         sendJson(res, 200, snapshot(now))
         return
@@ -801,6 +828,7 @@ export function apply(ctx, _config) {
         // 「恢复出厂」：删掉状态文件，下一次调用重新从第一个模型开始。
         removeFile(join(dir, 'state.json'))
         stateFile.replace(undefined)
+        cooldowns.clear()
         pushEvent({ at: now, kind: 'forget' })
         sendJson(res, 200, snapshot(now))
         return

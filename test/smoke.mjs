@@ -28,6 +28,7 @@ const { DailyHealth, normalizeState } = await import('../lib/health.js')
 const { JsonFile } = await import('../lib/store.js')
 const { DEFAULT_SETTINGS, ROUTE, routeKey } = await import('../lib/constants.js')
 const { TurnNotes } = await import('../lib/notes.js')
+const { Cooldowns } = await import('../lib/cooldown.js')
 
 // ── 假的宿主 ────────────────────────────────────────────────────────────────
 
@@ -118,6 +119,25 @@ const transportFail = () => async function* () {
 /** 远端 5xx：不是本机网络问题，该照常带「继续」重试。 */
 const upstream5xx = () => async function* () {
   yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'upstream returned 502 Bad Gateway' } } }
+}
+
+/**
+ * 被限流 —— 逐字抄自 2026-11-04 的线上事件日志（raccoon）。
+ *
+ * 关键是它自己写着「~5s 之后自动恢复」：把这种失败隔离一整天，正是用户报的
+ * 「明明还能用的模型，一次限流就被踢出队列」。
+ */
+const rateLimited = (message) => async function* () {
+  yield {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: {
+        code: 'RATE_LIMIT',
+        message: message ?? 'upstream rate-limited 4 consecutive request(s) to xiaohuanxiong.com; (~5s, exponential backoff)',
+      },
+    },
+  }
 }
 
 /**
@@ -224,18 +244,21 @@ async function harness({ order, scripts, settings: overrides = {}, at = new Date
   // 真的等 5 秒会让整套测试慢得没法跑；记下每次等待的时长，立刻返回。
   const waits = []
   const notes = new TurnNotes()
+  // 冷却表跟着假时钟走 —— 用例要靠 `clock.ms` 快进，验证「到点自动回来」。
+  const cooldowns = new Cooldowns({ now: () => clock.ms })
   const adapter = new FailoverAdapter({
     llm,
     settings,
     health,
     catalog,
     notes,
+    cooldowns,
     log: { warn: () => {}, push: (event) => events.push(event) },
     now: () => clock.ms,
     sleep: async (ms) => { waits.push(ms) },
   })
 
-  return { llm, clock, settings, health, catalog, adapter, notes, events, waits }
+  return { llm, clock, settings, health, catalog, adapter, notes, events, waits, cooldowns }
 }
 
 /** 收集整条流。 */
@@ -1211,6 +1234,192 @@ await check('隔离按「会话 × 模板」分开：默认模板撞的墙不影
 
   const spare = await drain(h.adapter.stream({ provider: ROUTE, model: 'spare', messages: [user('再跑备用')], sessionId: 's1' }))
   assert.equal(textOf(spare), '备用模板好着呢', '同一个会话换模板不该被另一条模板的隔离挡住')
+})
+
+// ── 限流：冷却，不是隔离 ────────────────────────────────────────────────────
+//
+// 用户报的原话：raccoon 的 deepseek-v4.1-flash「会因为限流而暂时不能用，而不是
+// 今天一天都不能用」，报错里上游自己写着「~5s, exponential backoff, auto-resumes
+// when the limit clears」。把它记成「今天出不了东西」是错的。
+
+await check('限流：只冷却，不写进当日隔离名单', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), rateLimited()],
+      [routeKey('beta', 'one'), ok('换人写完了')],
+    ]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑一下')], sessionId: 's1' }))
+  assert.equal(textOf(chunks), '换人写完了', '限流的那个让开，下一个接上')
+
+  const view = h.health.view(h.clock.ms, 1)
+  assert.deepEqual(view.quarantined, [], '限流绝不能被记成「今天出不了东西」')
+  assert.equal(h.cooldowns.has(routeKey('alpha', 'one')), true, '它该进冷却表')
+
+  const row = h.events.find((event) => event.kind === 'cooldown')
+  assert.ok(row !== undefined, '事件日志里要有一条 cooldown，而不是 quarantine')
+  assert.equal(row.code, 'RATE_LIMIT')
+  assert.equal(h.events.some((event) => event.kind === 'quarantine'), false, '一条 quarantine 都不该有')
+})
+
+await check('限流：正在冷却的模型下一轮直接跳过，不算隔离也能让开', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const scripts = new Map([
+    [alphaKey, rateLimited()],
+    [routeKey('beta', 'one'), ok('还是我来')],
+  ])
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第一轮')], sessionId: 's1' }))
+  // 第二轮：alpha 还在冷却里，队首应该直接是 beta —— 一次 alpha 的请求都不该发。
+  scripts.set(alphaKey, ok('我好了'))
+  const before = h.llm.calls.length
+  const second = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第二轮')], sessionId: 's1' }))
+
+  assert.equal(textOf(second), '还是我来', '冷却中的模型被跳过，beta 接手')
+  const touched = h.llm.calls.slice(before).map((call) => call.key)
+  assert.deepEqual(touched, [routeKey('beta', 'one')], `冷却期间不该再打 alpha：${JSON.stringify(touched)}`)
+})
+
+await check('限流：冷却到点自动回来，不用等到明天', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const scripts = new Map([
+    [alphaKey, rateLimited('rate limited, retry after 3s')],
+    [routeKey('beta', 'one'), ok('先顶着')],
+  ])
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第一轮')], sessionId: 's1' }))
+  assert.equal(h.cooldowns.has(alphaKey), true)
+
+  // 上游说 retry after 3s，就按 3 秒排 —— 不是设置里那个 60 秒。
+  assert.ok(h.cooldowns.remaining(alphaKey) <= 3_000, `实际剩 ${h.cooldowns.remaining(alphaKey)}ms`)
+
+  // 时间往前拨 3.1 秒：冷却该自己失效，队列重新从 alpha 开始。
+  h.clock.ms += 3_100
+  assert.equal(h.cooldowns.has(alphaKey), false, '到点就该自动解除')
+
+  scripts.set(alphaKey, ok('我回来了'))
+  const third = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第三轮')], sessionId: 's1' }))
+  assert.equal(textOf(third), '我回来了', '冷却结束后还是从队首那个模型开始')
+})
+
+await check('限流：同一个模型剩下的重发全部跳过，不往上游的队列里再塞请求', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [alphaKey, rateLimited()],
+      [routeKey('beta', 'one'), ok('我来')],
+    ]),
+    // 每个候选本来要试 3 次（1 + sameModelRetries 2）；限流之后只该打 1 次。
+    settings: { sameModelRetries: 2 },
+  })
+
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑一下')], sessionId: 's1' }))
+  const alphaCalls = h.llm.calls.filter((call) => call.key === alphaKey)
+  assert.equal(alphaCalls.length, 1, `限流之后不该再重发：实际打了 ${alphaCalls.length} 次`)
+})
+
+await check('限流：产出内容之后冷却立刻摘掉，不白等剩下的时间', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const scripts = new Map([
+    [alphaKey, rateLimited('rate limited, retry after 600s')],
+    [routeKey('beta', 'one'), ok('先顶着')],
+  ])
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第一轮')], sessionId: 's1' }))
+  assert.equal(h.cooldowns.has(alphaKey), true)
+
+  // 手动解掉冷却，让 alpha 回到队列；它一旦写出内容，冷却就该被删干净。
+  h.cooldowns.clear()
+  scripts.set(alphaKey, ok('我好了'))
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第二轮')], sessionId: 's1' }))
+  assert.equal(h.cooldowns.has(alphaKey), false, '产出内容说明早就缓过来了')
+})
+
+await check('限流：上游没说时间时用设置里的 cooldownSec，0 表示不冷却（回到隔离老路）', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const make = (settings) => harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [alphaKey, rateLimited('too many requests')],
+      [routeKey('beta', 'one'), ok('换人')],
+    ]),
+    settings,
+  })
+
+  const slow = await make({ cooldownSec: 120 })
+  await drain(slow.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑')], sessionId: 's1' }))
+  const remaining = slow.cooldowns.remaining(alphaKey)
+  assert.ok(remaining > 110_000 && remaining <= 120_000, `该按 120 秒冷却，实际 ${remaining}ms`)
+
+  const off = await make({ cooldownSec: 0 })
+  await drain(off.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑')], sessionId: 's1' }))
+  assert.equal(off.cooldowns.has(alphaKey), false, '0 = 不冷却')
+  assert.equal(off.health.view(off.clock.ms, 1).quarantined.length, 1, '关掉冷却就回到「隔离到明天」的老行为')
+})
+
+await check('限流：冷却不分会话 —— 限流是上游账号的事，换个会话也得等', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const scripts = new Map([
+    [alphaKey, rateLimited()],
+    [routeKey('beta', 'one'), ok('这边也换人')],
+  ])
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('甲会话')], sessionId: 's1' }))
+  // 换一个完全不同的会话：隔离不会跨会话，冷却会。
+  const before = h.llm.calls.length
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('乙会话')], sessionId: 's2' }))
+  const touched = h.llm.calls.slice(before).map((call) => call.key)
+  assert.deepEqual(touched, [routeKey('beta', 'one')], `冷却该跨会话生效：${JSON.stringify(touched)}`)
+})
+
+await check('限流判据：只看明确的限流信号，502 / 超时 / 网络中断都不算', async () => {
+  const { isTransientFailure, retryAfterFromMessage } = await import('../lib/cooldown.js')
+
+  // 该算的：码本身，以及上游把 429 包成 SERVER / UNKNOWN 的那些文本。
+  assert.equal(isTransientFailure({ code: 'RATE_LIMIT' }), true)
+  assert.equal(isTransientFailure({ code: 'SERVER', message: 'upstream rate-limited 4 consecutive request(s)' }), true)
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: 'Too Many Requests' }), true)
+  assert.equal(isTransientFailure({ code: 'SERVER', message: 'HTTP 429' }), true)
+  assert.equal(isTransientFailure({ code: 'SERVER', message: 'request throttled, slow down' }), true)
+
+  // 不该算的：这些是「真出问题」或「本机网络」，冷却它们会让队列反复撞同一堵墙。
+  assert.equal(isTransientFailure({ code: 'SERVER', message: 'upstream returned 502 Bad Gateway' }), false)
+  assert.equal(isTransientFailure({ code: 'TIMEOUT', message: 'request timed out after 300s' }), false)
+  assert.equal(isTransientFailure({ code: 'TRANSPORT', message: 'fetch failed' }), false)
+  assert.equal(isTransientFailure({ code: 'QUOTA', message: 'insufficient balance' }), false)
+  assert.equal(isTransientFailure({ code: 'EMPTY_RESPONSE' }), false)
+  assert.equal(isTransientFailure(undefined), false)
+
+  // 从文本里读「什么时候再来」。
+  const now = Date.parse('2026-11-04T08:44:40.000Z')
+  assert.equal(
+    retryAfterFromMessage('until 2026-11-04T08:44:44.803Z (~5s, exponential backoff)', now),
+    4_803,
+    '绝对时刻优先',
+  )
+  assert.equal(retryAfterFromMessage('rate limited, retry after 20s', now), 20_000)
+  assert.equal(retryAfterFromMessage('try again in 1500 ms', now), 1_500)
+  assert.equal(retryAfterFromMessage('slow down (~5s)', now), 5_000)
+  assert.equal(retryAfterFromMessage('too many requests', now), undefined, '没写时间就不猜')
 })
 
 await check('红绿计数：失败一次记一次、成功一次记一次，跨会话合计', async () => {

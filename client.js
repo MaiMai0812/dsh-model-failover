@@ -40,6 +40,8 @@ window.__ModuleLoader__.load({
     const MAX_SAME_MODEL_RETRIES = 5
     /** 与 lib/constants.js 的 MAX_IDLE_TIMEOUT_SEC 一致。 */
     const MAX_IDLE_TIMEOUT_SEC = 3600
+    /** 与 lib/constants.js 的 MAX_COOLDOWN_SEC 一致：再久就不该叫「冷却」了。 */
+    const MAX_COOLDOWN_SEC = 3600
 
     /**
      * 试连接同时发几条。
@@ -214,6 +216,11 @@ window.__ModuleLoader__.load({
         probeRunning: '正在等这个模型的回应',
         probeOkHint: '{ms} 毫秒收到回应',
         probeBadHint: '试连接失败',
+        // 限流冷却（和隔离不是一回事：那个是「今天不行」，这个只是「等一下」）。
+        coolingSec: '限流，还要 {n} 秒',
+        coolingMin: '限流，还要 {n} 分',
+        coolingMinSec: '限流，还要 {n} 分 {s} 秒',
+        coolingHint: '上游在限流。它只是暂时忙，等一会儿就会自动回到队列里，不算今天的隔离。',
         failCountHint: '今天这个模型一共失败了几次（所有会话合计）',
         goodCountHint: '今天这个模型成功了几次（所有会话合计）',
         queueHint:
@@ -249,6 +256,10 @@ window.__ModuleLoader__.load({
         optIdleTimeoutHint:
           '从请求发出去就开始计时，之后每来一个字（包括思考增量）都会重新计时。到点还一个字都没有，就当这个模型卡住了：按失败处理，换队列里的下一个。0 = 不管，愿意等多久就等多久。',
         optIdleTimeoutUnit: '秒',
+        optCooldown: '被限流后先绕开它多久',
+        optCooldownHint:
+          '限流是「等一下就能用」，不是「今天不行」，所以它不进当日隔离名单：只让队列在这么多秒里跳过它，到点自动回来。上游在报错里说了具体时间（比如「再等 20 秒」）就以它为准，这个值只在它没说时兜底。0 = 不冷却，限流照旧隔离到明天。',
+        optCooldownUnit: '秒',
         optAllQuarantined: '全部被隔离时仍然按顺序试一遍',
         optAllQuarantinedHint: '关掉后队列里全是隔离模型时会直接报错，不再尝试。',
         optKeepLog: '记录事件日志',
@@ -303,6 +314,7 @@ window.__ModuleLoader__.load({
         eventsEmpty: '还没有记录。',
         evGood: '{provider}/{model} 产出内容，标记为可用',
         evQuarantine: '{provider}/{model} 无法输出（{code}），今日隔离',
+        evCooldown: '{provider}/{model} 被限流（{code}），先绕开 {sec} 秒，不算今日隔离',
         evRollover: '跨过 {hour} 点：{from} → {to}，隔离名单已清空',
         evReset: '手动解除隔离，清了 {count} 个',
         evResetSession: '会话 {session} 手动解除隔离，清了 {count} 个',
@@ -380,6 +392,11 @@ window.__ModuleLoader__.load({
         probeRunning: 'Waiting for this model',
         probeOkHint: 'Answered in {ms} ms',
         probeBadHint: 'Connection test failed',
+        coolingSec: 'Rate limited — {n}s',
+        coolingMin: 'Rate limited — {n}m',
+        coolingMinSec: 'Rate limited — {n}m {s}s',
+        coolingHint:
+          'The upstream is rate limiting. It is only busy for a moment and returns to the queue automatically; this is not a quarantine for the day.',
         failCountHint: 'How many times this model failed today (all conversations)',
         goodCountHint: 'How many times this model succeeded today (all conversations)',
         queueHint:
@@ -415,6 +432,10 @@ window.__ModuleLoader__.load({
         optIdleTimeoutHint:
           'The clock starts when the request goes out and resets on every chunk, reasoning deltas included. If nothing arrives before it runs out, the model is treated as stuck: the attempt counts as a failure and the next one in the queue takes over. 0 = never give up, wait as long as it takes.',
         optIdleTimeoutUnit: 'sec',
+        optCooldown: 'Skip a rate-limited model for',
+        optCooldownHint:
+          'A rate limit means "try again in a moment", not "broken for the day", so it never enters the daily quarantine list: the queue just steps around it for this many seconds and comes back on its own. If the upstream says when to retry (e.g. "retry after 20s"), that wins; this value is the fallback. 0 = no cooldown, rate limits go back to being quarantined until tomorrow.',
+        optCooldownUnit: 'sec',
         optAllQuarantined: 'Still try the queue when all are quarantined',
         optAllQuarantinedHint: 'Turned off, an all-quarantined queue fails immediately.',
         optKeepLog: 'Keep an event log',
@@ -469,6 +490,7 @@ window.__ModuleLoader__.load({
         eventsEmpty: 'Nothing recorded yet.',
         evGood: '{provider}/{model} produced output — marked usable',
         evQuarantine: '{provider}/{model} produced nothing ({code}) — quarantined today',
+        evCooldown: '{provider}/{model} was rate limited ({code}) — stepping around it for {sec}s, not a quarantine',
         evRollover: 'Crossed {hour}:00 — {from} → {to}, quarantine cleared',
         evReset: 'Quarantine cleared by hand — {count} released',
         evResetSession: 'Quarantine cleared by hand in conversation {session} — {count} released',
@@ -871,6 +893,21 @@ window.__ModuleLoader__.load({
         [state],
       )
 
+      /**
+       * 正在限流冷却里的模型：`key -> 还要等多少毫秒`。
+       *
+       * 和隔离是两件事：隔离是「今天别指望它」，冷却只是「过几十秒再来」。
+       * 队列行上给一个小标签，免得用户看到排第一的模型被跳过却不知道为什么。
+       */
+      const coolingLeft = useMemo(() => {
+        const map = new Map()
+        for (const row of state?.cooling ?? []) {
+          if (typeof row.key !== 'string') continue
+          map.set(row.key, Number.isFinite(row.remainingMs) ? row.remainingMs : 0)
+        }
+        return map
+      }, [state])
+
       /** 已接入但还没进队列的模型，按 provider 分组给下拉框用。 */
       const available = useMemo(() => {
         const inQueue = new Set(order.map((item) => keyOf(item.provider, item.model)))
@@ -1161,12 +1198,36 @@ window.__ModuleLoader__.load({
           : `${code} — ${row.message}`
       }
 
-      /** 队列里第一个没被隔离的模型 —— 也就是下一个任务会从谁起头。 */
+      /**
+       * 「还要等 N 秒」——冷却剩多少。
+       *
+       * 超过一分钟就按分钟说：`还要等 2 分 10 秒` 比 `还要等 130 秒` 好读，
+       * 而冷却最长也就一小时（设置里的上界）。
+       */
+      const coolingText = (ms) => {
+        const total = Math.max(0, Math.ceil(ms / 1000))
+        if (total < 60) return t('coolingSec', { n: total })
+        const minutes = Math.floor(total / 60)
+        const seconds = total % 60
+        return seconds === 0
+          ? t('coolingMin', { n: minutes })
+          : t('coolingMinSec', { n: minutes, s: seconds })
+      }
+
+      /**
+       * 队列里第一个真正能用的模型 —— 也就是下一个任务会从谁起头。
+       *
+       * 隔离的（今天不行）和冷却中的（限流，还要等几十秒）都要跳过：两者都会
+       * 被 `chain()` 滤掉，说「下一个从它开始」就是在骗人。
+       */
       const startAt = useMemo(() => {
         if (order.length === 0) return undefined
-        const usable = order.find((item) => !quarantinedKeys.has(keyOf(item.provider, item.model)))
+        const usable = order.find((item) => {
+          const key = keyOf(item.provider, item.model)
+          return !quarantinedKeys.has(key) && !coolingLeft.has(key)
+        })
         return usable ?? order[0]
-      }, [order, quarantinedKeys])
+      }, [order, quarantinedKeys, coolingLeft])
 
       const labelOf = useCallback((provider, model) => {
         const hit = (state?.catalog ?? []).find((row) => row.provider === provider && row.model === model)
@@ -1186,6 +1247,14 @@ window.__ModuleLoader__.load({
             break
           case 'quarantine':
             body = t('evQuarantine', { provider: event.provider, model: event.model, code: event.code ?? '?' })
+            break
+          case 'cooldown':
+            body = t('evCooldown', {
+              provider: event.provider,
+              model: event.model,
+              code: event.code ?? '?',
+              sec: Math.max(1, Math.round((event.ms ?? 0) / 1000)),
+            })
             break
           case 'rollover':
             body = t('evRollover', { hour: settings?.resetHour ?? 1, from: event.from ?? '?', to: event.to ?? '?' })
@@ -1432,6 +1501,15 @@ window.__ModuleLoader__.load({
                             title: probeHint(probeRow),
                             'data-role': 'probe',
                           }, probeText(probeRow)),
+                      // 被限流：只是让它歇一会儿，不是「今天不行」。跟隔离分开画，
+                      // 否则用户会以为这个模型今天废了。
+                      coolingLeft.has(key)
+                        ? span({
+                            className: 'mf-probe mf-probe-busy',
+                            title: t('coolingHint'),
+                            'data-role': 'cooling',
+                          }, coolingText(coolingLeft.get(key)))
+                        : null,
                     ),
                     div({ className: 'mf-sub' }, `${hit?.providerName ?? item.provider} · ${item.model}`),
                   ),
@@ -1550,6 +1628,21 @@ window.__ModuleLoader__.load({
                 onCommit: (value) => { if (value !== settings.idleTimeoutSec) void run('/settings', { idleTimeoutSec: value }) },
               }),
               span({ className: 'mf-note' }, t('optIdleTimeoutUnit')),
+            ),
+            div({ className: 'mf-opt' },
+              div({ className: 'mf-opt-main' },
+                div(null, t('optCooldown')),
+                div({ className: 'mf-note' }, t('optCooldownHint')),
+              ),
+              h(NumberInput, {
+                value: settings.cooldownSec ?? 60,
+                min: 0,
+                max: MAX_COOLDOWN_SEC,
+                name: 'cooldownSec',
+                disabled: busy || settings.enabled === false,
+                onCommit: (value) => { if (value !== settings.cooldownSec) void run('/settings', { cooldownSec: value }) },
+              }),
+              span({ className: 'mf-note' }, t('optCooldownUnit')),
             ),
             h(ToggleRow, {
               label: t('optAllQuarantined'),

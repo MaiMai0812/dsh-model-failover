@@ -319,6 +319,7 @@ const initialState = () => ({
     retrySameModelOnce: true,
     sameModelRetries: 2,
     idleTimeoutSec: 120,
+    cooldownSec: 60,
     continueText: '继续',
     hiddenProviders: ['qodercn'],
     retryWhenAllQuarantined: true,
@@ -364,6 +365,8 @@ const initialState = () => ({
     { key: KEY('gamma', 'two'), provider: 'gamma', model: 'two', code: 'TRANSPORT', message: LONG_ERROR, at: at - 60_000, label: 'FutureHub · Gamma Two', sessionId: 'sess-long-name' },
   ],
   good: [{ key: KEY('alpha', 'one'), at, provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One' }],
+  // 限流冷却表：宿主内存里的那一份（不落盘），默认空着 —— 多数用例不关心它。
+  cooling: [],
   // 红绿数字：全机器合计，跨会话跨模板都算在同一个模型头上。
   counts: {
     [KEY('alpha', 'one')]: { fail: 0, ok: 7 },
@@ -1340,7 +1343,7 @@ globalThis.fetch = async (url, init = {}) => {
         }))
       }
       if (typeof body.editedTemplate === 'string') current.settings.editedTemplate = body.editedTemplate
-      for (const key of ['enabled', 'retrySameModelOnce', 'sameModelRetries', 'idleTimeoutSec', 'continueText', 'resetHour', 'keepEventLog', 'eventLogLimit', 'retryWhenAllQuarantined', 'autoContinue', 'autoContinueOnFailure', 'autoContinueOnMaxTokens', 'autoContinueFailureLimit', 'autoContinueMaxTokensLimit', 'continueDelaySec', 'showSubagentSessions', 'showForeignSessions']) {
+      for (const key of ['enabled', 'retrySameModelOnce', 'sameModelRetries', 'idleTimeoutSec', 'cooldownSec', 'continueText', 'resetHour', 'keepEventLog', 'eventLogLimit', 'retryWhenAllQuarantined', 'autoContinue', 'autoContinueOnFailure', 'autoContinueOnMaxTokens', 'autoContinueFailureLimit', 'autoContinueMaxTokensLimit', 'continueDelaySec', 'showSubagentSessions', 'showForeignSessions']) {
         if (body[key] !== undefined) current.settings[key] = body[key]
       }
       if (Array.isArray(body.hiddenProviders)) {
@@ -1646,6 +1649,153 @@ await check('右键弹窗：✕ 关掉小窗，不写回设置', async () => {
   await runtime.mount(page(props))
   assert.equal(windowEditor(), undefined, '✕ 收起小窗')
   assert.equal(requests.slice(before).filter((row) => row.method === 'POST').length, 0, '关窗不写回')
+})
+
+await check('限流冷却：队列行上写「还要等 N 秒」，和隔离分得开', async () => {
+  // 冷却表是宿主内存里的一份，`/state` 里叫 `cooling`。这里用全新的 Runtime：
+  // hook 单元按「路径 + 类型名」跨 mount 复用，改 current 再 mount 刷不出来。
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = initialState()
+  state.cooling = [
+    {
+      key: KEY('alpha', 'one'),
+      provider: 'alpha',
+      model: 'one',
+      code: 'RATE_LIMIT',
+      message: 'upstream rate-limited 4 consecutive request(s)',
+      ms: 25_000,
+      remainingMs: 25_000,
+    },
+  ]
+  globalThis.fetch = async () => payloadResponse(state)
+  let flat
+  let chips
+  try {
+    flat = fresh.text(await fresh.mount(page(props)))
+    chips = fresh.nodes.filter((node) => node.props?.['data-role'] === 'cooling')
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  assert.equal(chips.length, 1, '只有冷却中的那一行带标签')
+  assert.equal(chips[0].text, 'coolingSec', '25 秒按秒说')
+  assert.equal(chips[0].props.title, 'coolingHint', '悬停要说明这不是隔离')
+})
+
+await check('限流冷却：超过一分钟按分说，剩整分时不带秒', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = initialState()
+  state.cooling = [
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', ms: 120_000, remainingMs: 130_000 },
+    { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'RATE_LIMIT', ms: 120_000, remainingMs: 120_000 },
+  ]
+  globalThis.fetch = async () => payloadResponse(state)
+  let chips
+  try {
+    await fresh.mount(page(props))
+    chips = fresh.nodes.filter((node) => node.props?.['data-role'] === 'cooling')
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  assert.equal(chips.length, 2)
+  // 顺序跟队列一致：alpha 在前。130 秒 = 2 分 10 秒；120 秒整 = 2 分。
+  assert.equal(chips[0].text, 'coolingMinSec')
+  assert.equal(chips[1].text, 'coolingMin')
+})
+
+await check('限流冷却：冷却中的模型不算「下一个从谁开始」', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = initialState()
+  // 队首 alpha 在冷却里 —— 下一个任务其实会从 beta 起头。
+  // 只留 beta 一条隔离，让队列里确实还有得选：三条都不可用时 startAt 会回落到
+  // 队首（那是「总得挑一个」的兜底），就测不出「跳过」这件事了。
+  state.quarantined = state.quarantined.filter((row) => row.provider === 'beta')
+  state.cooling = [
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', ms: 30_000, remainingMs: 30_000 },
+  ]
+  globalThis.fetch = async () => payloadResponse(state)
+  let flat
+  try {
+    flat = fresh.text(await fresh.mount(page(props)))
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  // 状态卡片里「下一个从谁开始」那格应当跳过 alpha（冷却）与 beta（隔离），
+  // 落到 gamma 身上 —— 这两条规则在同一个判断里。
+  const pickCell = fresh.nodes.find(
+    (node) => node.props?.className === 'mf-kv' && String(node.text ?? '').startsWith('pickNow'),
+  )
+  assert.ok(pickCell !== undefined, '状态卡片里要有「下一个从谁开始」这一格')
+  assert.ok(String(pickCell.text).includes('Gamma Two'), `实际：${pickCell.text}`)
+  assert.equal(String(pickCell.text).includes('Alpha One'), false, '冷却中的 alpha 不该被说成起点')
+})
+
+await check('限流冷却：cooldownSec 显示宿主的值，改它 POST 一个整数', async () => {
+  const coolingInput = () => runtime.find(
+    (node) => node.tag === 'input' && node.props['data-name'] === 'cooldownSec',
+  )
+  assert.equal(coolingInput().props.value, '60', '默认 60 秒')
+
+  const before = requests.length
+  coolingInput().props.onChange({ target: { value: '120' } })
+  await runtime.mount(page(props))
+  coolingInput().props.onBlur()
+  await runtime.mount(page(props))
+
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.equal(posts.length, 1)
+  assert.deepEqual(posts[0].body, { cooldownSec: 120 })
+  assert.equal(current.settings.cooldownSec, 120)
+
+  // 0 是一个有意义的取值（关掉冷却），必须能填进去，不能被夹成别的数。
+  coolingInput().props.onChange({ target: { value: '0' } })
+  await runtime.mount(page(props))
+  coolingInput().props.onBlur()
+  await runtime.mount(page(props))
+  assert.equal(current.settings.cooldownSec, 0, '0 = 关掉冷却')
+
+  // 恢复默认，别影响后面的用例。
+  coolingInput().props.onChange({ target: { value: '60' } })
+  await runtime.mount(page(props))
+  coolingInput().props.onBlur()
+  await runtime.mount(page(props))
+})
+
+await check('限流冷却：事件日志有专属文案，带上秒数', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = initialState()
+  state.events = [
+    {
+      at: Date.now(),
+      kind: 'cooldown',
+      provider: 'raccoon',
+      model: 'deepseek-v4.1-flash',
+      code: 'RATE_LIMIT',
+      message: 'upstream rate-limited',
+      ms: 5_000,
+    },
+  ]
+  globalThis.fetch = async () => payloadResponse(state)
+  let flat
+  try {
+    flat = fresh.text(await fresh.mount(page(props)))
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  assert.ok(flat.includes('evCooldown'), `应走专属文案，实际：${flat.slice(-260)}`)
+  assert.equal(flat.includes('evQuarantine'), false, '限流不该说成隔离')
+
+  const zh = dictionaries.get('settings.modelFailover').zh
+  assert.ok(zh.evCooldown.includes('{sec}'), '文案要留出秒数插槽')
+  assert.ok(zh.evCooldown.includes('不算今日隔离'), '要写明这不是隔离')
+  assert.ok(zh.optCooldownHint.includes('0'), '说明里要点出 0 的含义')
 })
 
 await check('✕ 把这一行移出队列', async () => {
