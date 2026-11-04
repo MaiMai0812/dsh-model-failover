@@ -141,6 +141,15 @@ const rateLimited = (message) => async function* () {
 }
 
 /**
+ * 一个通用的失败脚本：错误码和文案由用例自己指定。
+ * @param {string} code
+ * @param {string} message
+ */
+const failing = (code, message) => async function* () {
+  yield { type: 'finish', reason: { kind: 'error', failure: { code, message } } }
+}
+
+/**
  * 每个模型自己的思考强度档位表（真实宿主里由 `resolveModelInfo` 给出）。
  *
  * 刻意让各家不一样：alpha/one 只认 low/high，beta/one 只认 minimal/high，
@@ -1310,6 +1319,108 @@ await check('限流：冷却到点自动回来，不用等到明天', async () =
   scripts.set(alphaKey, ok('我回来了'))
   const third = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第三轮')], sessionId: 's1' }))
   assert.equal(textOf(third), '我回来了', '冷却结束后还是从队首那个模型开始')
+})
+
+await check('限流：到点时替它跑的那一趟还没收工，就先别抢回队首', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const scripts = new Map([
+    [alphaKey, rateLimited('rate limited, retry after 3s')],
+    [betaKey, ok('先顶着')],
+  ])
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  // 已经有一趟在跑（beta 正替它干活，那一条流还没收工）。
+  const open = h.cooldowns.beginCall()
+
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第一轮')], sessionId: 's1' }))
+  assert.equal(h.cooldowns.has(alphaKey), true, '限流之后进冷却')
+
+  // 上游说的等待时间到了 —— 但替它跑的那一趟还没跑完。
+  h.clock.ms += 3_100
+  assert.equal(h.cooldowns.remaining(alphaKey), 0, '等待时间确实已经结束')
+  assert.equal(h.cooldowns.held(alphaKey), true, '它现在是「等这一趟跑完」')
+  assert.equal(h.cooldowns.has(alphaKey), true, '那一趟还在跑，先别回队首')
+
+  // 界面上要说得清楚：不是「还要 0 秒」，而是「等这一趟跑完」。
+  const held = h.cooldowns.view().find((row) => row.key === alphaKey)
+  assert.equal(held?.held, true, 'view() 里要标成 held')
+  assert.equal(held?.remainingMs, 0)
+
+  scripts.set(alphaKey, ok('我回来了'))
+  const before = h.llm.calls.length
+  const second = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第二轮')], sessionId: 's1' }))
+  assert.deepEqual(h.llm.calls.slice(before).map((call) => call.key), [betaKey], '这一轮还得让顶着的那一个跑')
+  assert.equal(textOf(second), '先顶着')
+
+  // 那一趟收工了 —— 它这才归队。
+  h.cooldowns.endCall(open)
+  assert.equal(h.cooldowns.has(alphaKey), false, '替它跑的收工了，就该归队')
+
+  const third = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第三轮')], sessionId: 's1' }))
+  assert.equal(textOf(third), '我回来了', '归队之后从它起头')
+})
+
+await check('限流：替它跑的那一趟收工时，不管成功还是报错，都算「跑完了」', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const scripts = new Map([
+    [alphaKey, rateLimited('too many requests, retry after 3s')],
+    [routeKey('beta', 'one'), ok('先顶着')],
+  ])
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  const open = h.cooldowns.beginCall()
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第一轮')], sessionId: 's1' }))
+  h.clock.ms += 3_100
+  assert.equal(h.cooldowns.held(alphaKey), true)
+
+  // `stream()` 的 finally 会调 `endCall` —— 成功、报错、被取消都走这一条路。
+  h.cooldowns.endCall(open)
+  assert.equal(h.cooldowns.held(alphaKey), false, '收工就算跑完了')
+  scripts.set(alphaKey, ok('我回来了'))
+  const next = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('第二轮')], sessionId: 's1' }))
+  assert.equal(textOf(next), '我回来了', '那一趟收工了，就该它上')
+})
+
+await check('请求太大：不接力、不隔离，原样交回让宿主去压缩', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  // 用户报的原话（billion-context 拦下来时就是这么写的），码是 HTTP_422。
+  const oversize = failing(
+    'HTTP_422',
+    '422: {"type":"server_error","code":"bili_gate_oversize_refusal","message":"refused this request locally: this body would go to the provider uncompressed — but its core text alone (~5,001,529 tok floor estimate from 20,006,116 B / 4) exceeds the model context window (1,000,000); the provider rejects it and every retry re-sends the same oversized history"}',
+  )
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([[alphaKey, oversize], [betaKey, ok('下一个')]]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('大文件')], sessionId: 's1' }))
+  assert.equal(finishOf(chunks)?.reason?.kind, 'error')
+  assert.equal(finishOf(chunks)?.reason?.failure?.code, 'CONTEXT_WINDOW_EXCEEDED', '要改判成超长，宿主才认得')
+  // 关键的一条：**不能**再去碰下一个模型 —— 换人只会把同一坨 20MB 再发一遍。
+  assert.deepEqual(commands(h.llm), [alphaKey], '不该换人')
+  assert.equal(h.events.filter((event) => event.kind === 'quarantine').length, 0, '也不该隔离')
+})
+
+await check('请求太大：不带「太大」字样的 422 照旧接力，别把普通报错认成超长', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([[alphaKey, failing('HTTP_422', '422 参数不合法：字段 reasoning_content 缺失')], [betaKey, ok('我来')]]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑一下')], sessionId: 's1' }))
+  assert.equal(textOf(chunks), '我来', '该换人还是得换')
+  assert.equal(commands(h.llm).at(-1), betaKey, '轮到下一个模型了')
+  assert.equal(h.events.some((event) => event.kind === 'quarantine' && event.provider === 'alpha'), true, '这个模型确实坏了')
 })
 
 await check('限流：同一个模型剩下的重发全部跳过，不往上游的队列里再塞请求', async () => {

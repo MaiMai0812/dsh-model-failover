@@ -1706,6 +1706,30 @@ await check('限流冷却：超过一分钟按分说，剩整分时不带秒', a
   assert.equal(chips[1].text, 'coolingMin')
 })
 
+await check('限流冷却：等待时间到了但还没轮上，说的是「等这一趟跑完」', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = initialState()
+  // 宿主标了 held：等待时间已经结束，但替它跑的那一趟还没收工。
+  state.cooling = [
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', ms: 3_000, remainingMs: 0, held: true },
+    { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'RATE_LIMIT', ms: 30_000, remainingMs: 25_000 },
+  ]
+  globalThis.fetch = async () => payloadResponse(state)
+  let chips
+  try {
+    await fresh.mount(page(props))
+    chips = fresh.nodes.filter((node) => node.props?.['data-role'] === 'cooling')
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  assert.equal(chips.length, 2)
+  assert.equal(chips[0].text, 'coolingHeld', '不能写「还要 0 秒」')
+  assert.equal(chips[0].props.title, 'coolingHeldHint', '悬停要说清楚在等什么')
+  assert.equal(chips[1].text, 'coolingSec', '还在冷却的那条照旧按秒说')
+})
+
 await check('限流冷却：冷却中的模型不算「下一个从谁开始」', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch

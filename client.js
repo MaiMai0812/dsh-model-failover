@@ -221,6 +221,8 @@ window.__ModuleLoader__.load({
         coolingMin: '限流，还要 {n} 分',
         coolingMinSec: '限流，还要 {n} 分 {s} 秒',
         coolingHint: '上游在限流。它只是暂时忙，等一会儿就会自动回到队列里，不算今天的隔离。',
+        coolingHeld: '限流已结束，等这一趟跑完',
+        coolingHeldHint: '上游的等待时间已经到了，但现在这一趟是别的模型在替它干活。要等这一趟跑完或者报错，它才能回到队首。',
         failCountHint: '今天这个模型一共失败了几次（所有会话合计）',
         goodCountHint: '今天这个模型成功了几次（所有会话合计）',
         queueHint:
@@ -397,6 +399,9 @@ window.__ModuleLoader__.load({
         coolingMinSec: 'Rate limited — {n}m {s}s',
         coolingHint:
           'The upstream is rate limiting. It is only busy for a moment and returns to the queue automatically; this is not a quarantine for the day.',
+        coolingHeld: 'Rate limit over — waiting for this call to finish',
+        coolingHeldHint:
+          'The upstream wait is over, but another model is currently running the call in its place. It only gets the front of the queue back once that call finishes or fails.',
         failCountHint: 'How many times this model failed today (all conversations)',
         goodCountHint: 'How many times this model succeeded today (all conversations)',
         queueHint:
@@ -908,6 +913,20 @@ window.__ModuleLoader__.load({
         return map
       }, [state])
 
+      /**
+       * 冷却到点、但替它跑的那一趟还没收工的那些。
+       *
+       * 它们仍然排不上去，可剩余时间已经是 0 了 —— 光写「还要 0 秒」只会让人以为
+       * 卡住了，得说清楚它在等什么。
+       */
+      const coolingHeld = useMemo(() => {
+        const set = new Set()
+        for (const row of state?.cooling ?? []) {
+          if (typeof row.key === 'string' && row.held === true) set.add(row.key)
+        }
+        return set
+      }, [state])
+
       /** 已接入但还没进队列的模型，按 provider 分组给下拉框用。 */
       const available = useMemo(() => {
         const inQueue = new Set(order.map((item) => keyOf(item.provider, item.model)))
@@ -1204,7 +1223,8 @@ window.__ModuleLoader__.load({
        * 超过一分钟就按分钟说：`还要等 2 分 10 秒` 比 `还要等 130 秒` 好读，
        * 而冷却最长也就一小时（设置里的上界）。
        */
-      const coolingText = (ms) => {
+      const coolingText = (ms, held) => {
+        if (held === true) return t('coolingHeld')
         const total = Math.max(0, Math.ceil(ms / 1000))
         if (total < 60) return t('coolingSec', { n: total })
         const minutes = Math.floor(total / 60)
@@ -1506,9 +1526,9 @@ window.__ModuleLoader__.load({
                       coolingLeft.has(key)
                         ? span({
                             className: 'mf-probe mf-probe-busy',
-                            title: t('coolingHint'),
+                            title: coolingHeld.has(key) ? t('coolingHeldHint') : t('coolingHint'),
                             'data-role': 'cooling',
-                          }, coolingText(coolingLeft.get(key)))
+                          }, coolingText(coolingLeft.get(key), coolingHeld.has(key)))
                         : null,
                     ),
                     div({ className: 'mf-sub' }, `${hit?.providerName ?? item.provider} · ${item.model}`),
