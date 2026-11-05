@@ -44,6 +44,7 @@ import {
 } from './lib/constants.js'
 import { Cooldowns } from './lib/cooldown.js'
 import { DailyHealth, nextResetAt, normalizeState } from './lib/health.js'
+import { Concurrency, MAX_CONCURRENCY, concurrencyOf } from './lib/limits.js'
 import { TurnNotes } from './lib/notes.js'
 import { JsonFile, dataDir, removeFile } from './lib/store.js'
 import { rejectionFor } from './lib/trust.js'
@@ -134,9 +135,13 @@ function normalizeCandidates(raw) {
       Number.isInteger(item.contextWindow) && item.contextWindow > 0
         ? item.contextWindow
         : undefined
+    // 并发上限：这个上游最多同时收几个会话的请求。没设（或设成 0 之类）就不限制，
+    // 这是绝大多数候选的情形 —— 上限只在用户真的填了数字时才参与选人。
+    const concurrency = concurrencyOf(item.concurrency)
     const entry = { provider, model }
     if (reasoningEffort !== undefined) entry.reasoningEffort = reasoningEffort
     if (contextWindow !== undefined) entry.contextWindow = contextWindow
+    if (concurrency !== undefined) entry.concurrency = concurrency
     order.push(entry)
   }
   return order
@@ -371,10 +376,50 @@ export function apply(ctx, _config) {
    */
   const cooldowns = new Cooldowns({ now: () => Date.now() })
 
+  /**
+   * 每个候选自带的并发上限占用表。
+   *
+   * 和冷却一样只活在内存里：上限本身（用户设的那个数）跟着模板落盘，但**谁正
+   * 占着**只在有请求跑着的时候才有意义 —— 重启之后没有任何请求在跑，把占用
+   * 一起忘掉才是对的。建在这里的理由也同冷却：设置页 API 要读它（会话页那一栏
+   * 要显示「用了几格」），`/reset` 也要能顺手清掉。
+   */
+  const limits = new Concurrency({ now: () => Date.now() })
+
   /** 把 `provider / model` 换成人看的名字；清单里查不到就原样回落。 */
   const labelOf = (provider, model) => {
     const hit = catalog.cached().find((row) => row.provider === provider && row.model === model)
     return hit === undefined ? `${provider} / ${model}` : `${hit.providerName} · ${hit.name}`
+  }
+
+  /**
+   * 某个模板里「设了并发上限」的那些候选。
+   *
+   * 只有用户真的填了数字的候选才会出现在这里 —— 没填的候选不该在界面上多出
+   * 一行「0 / 不限」，那是噪音。
+   */
+  const capsFor = (templateId) => {
+    const templates = settingsFile.get().templates
+    const template = templates.find((item) => item.id === templateId) ?? templates[0]
+    const caps = new Map()
+    for (const item of Array.isArray(template?.order) ? template.order : []) {
+      const cap = concurrencyOf(item?.concurrency)
+      if (cap === undefined) continue
+      caps.set(routeKey(item.provider, item.model), { cap, provider: item.provider, model: item.model })
+    }
+    return caps
+  }
+
+  /** 这些上限此刻占了几格。跨模板按候选去重，一个候选最多出现一次。 */
+  const limitsView = (templateId) => {
+    let caps = capsFor(templateId)
+    if (templateId === undefined) {
+      caps = new Map()
+      for (const template of settingsFile.get().templates) {
+        for (const [key, meta] of capsFor(template.id)) if (!caps.has(key)) caps.set(key, meta)
+      }
+    }
+    return limits.view(caps).map((row) => ({ ...row, label: labelOf(row.provider, row.model) }))
   }
 
   const adapter = new FailoverAdapter({
@@ -384,6 +429,7 @@ export function apply(ctx, _config) {
     catalog,
     notes,
     cooldowns,
+    limits,
     log: {
       warn: (message) => logger.warn?.(`model-failover: ${message}`),
       push: (event) => pushEvent(event),
@@ -576,6 +622,13 @@ export function apply(ctx, _config) {
         templateName: hit.templateId === undefined ? '' : templateName(hit.templateId),
       }
     }
+    // 并发占用：挂在这个会话自己的模板上。取模板的优先级与上面显示「模板」那一栏
+    // 一致 —— 正在跑的 > 上一趟跑的 > 默认模板。会话还没跑过任何一趟时它照样
+    // 列出上限（占用量当然是 0），用户设完就能看见。
+    for (const row of table.values()) {
+      const templateId = row.running?.templateId ?? row.active?.templateId ?? DEFAULT_TEMPLATE_ID
+      row.capped = limitsView(templateId)
+    }
     // 有事的会话排前面：隔离着的 → 正在跑的 → 其余。
     return [...table.values()].sort((left, right) => {
       const weight = (row) => (row.quarantined.length > 0 ? 0 : row.active !== undefined || row.running !== undefined ? 1 : 2)
@@ -622,6 +675,10 @@ export function apply(ctx, _config) {
       // 正在限流冷却里的模型（内存态，不分会话）。队列行据此显示「还要等 N 秒」，
       // 免得用户看到排第一的模型莫名其妙被跳过 —— 它只是被限流了，没坏。
       cooling: cooldowns.view().map(decorate),
+      // 设了并发上限的候选此刻占了几格（内存态，跨模板去重）。会话页那一栏按会话
+      // 显示，设置页的队列行也可以直接读这份；`maxConcurrency` 是输入框的上界。
+      limits: limitsView(undefined),
+      maxConcurrency: MAX_CONCURRENCY,
       // 每模型当天的失败/成功次数（所有会话、所有模板合计）——设置页队列前面
       // 那对红绿数字就是它。
       counts: view.counts,
@@ -792,6 +849,7 @@ export function apply(ctx, _config) {
           // 冷却一起解掉：用户点这个按钮的意思是「现在就重新试它」，
           // 留着「还要再等 40 秒」只会让他点了没反应。
           cooldowns.clear()
+          limits.clear()
           pushEvent({
             at: now,
             kind: 'reset',
@@ -812,6 +870,7 @@ export function apply(ctx, _config) {
         health.clear(now, settings.resetHour)
         stateFile.flush()
         cooldowns.clear()
+        limits.clear()
         pushEvent({ at: now, kind: 'reset', cleared: view.quarantined.length, day: view.day })
         sendJson(res, 200, snapshot(now))
         return
@@ -829,6 +888,7 @@ export function apply(ctx, _config) {
         removeFile(join(dir, 'state.json'))
         stateFile.replace(undefined)
         cooldowns.clear()
+        limits.clear()
         pushEvent({ at: now, kind: 'forget' })
         sendJson(res, 200, snapshot(now))
         return

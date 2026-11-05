@@ -29,6 +29,7 @@ const { JsonFile } = await import('../lib/store.js')
 const { DEFAULT_SETTINGS, ROUTE, routeKey } = await import('../lib/constants.js')
 const { TurnNotes } = await import('../lib/notes.js')
 const { Cooldowns } = await import('../lib/cooldown.js')
+const { Concurrency, concurrencyOf, MAX_CONCURRENCY } = await import('../lib/limits.js')
 
 // ── 假的宿主 ────────────────────────────────────────────────────────────────
 
@@ -255,6 +256,8 @@ async function harness({ order, scripts, settings: overrides = {}, at = new Date
   const notes = new TurnNotes()
   // 冷却表跟着假时钟走 —— 用例要靠 `clock.ms` 快进，验证「到点自动回来」。
   const cooldowns = new Cooldowns({ now: () => clock.ms })
+  // 并发占用表：和冷却一样在这个假 harness 里自己建一份，用例要直接查它。
+  const limits = new Concurrency({ now: () => clock.ms })
   const adapter = new FailoverAdapter({
     llm,
     settings,
@@ -262,12 +265,13 @@ async function harness({ order, scripts, settings: overrides = {}, at = new Date
     catalog,
     notes,
     cooldowns,
+    limits,
     log: { warn: () => {}, push: (event) => events.push(event) },
     now: () => clock.ms,
     sleep: async (ms) => { waits.push(ms) },
   })
 
-  return { llm, clock, settings, health, catalog, adapter, notes, events, waits, cooldowns }
+  return { llm, clock, settings, health, catalog, adapter, notes, events, waits, cooldowns, limits }
 }
 
 /** 收集整条流。 */
@@ -280,6 +284,9 @@ async function drain(iterable) {
 const textOf = (chunks) => chunks.filter((c) => c.type === 'text-delta').map((c) => c.text).join('')
 const finishOf = (chunks) => chunks.find((c) => c.type === 'finish')
 const commands = (llm) => llm.calls.map((call) => call.key)
+/** 拿一个假 harness 跑一趟接力（并发用例要在同一个 harness 上反复跑）。 */
+const runS1 = (h, sessionId = 's1') =>
+  h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑')], sessionId })
 /** 一条最简的用户消息。 */
 const user = (text) => ({ role: 'user', content: [{ type: 'text', text }] })
 /** 一条消息里最后那段文本 —— 用来确认「继续」有没有真的发出去。 */
@@ -1531,6 +1538,155 @@ await check('限流判据：只看明确的限流信号，502 / 超时 / 网络�
   assert.equal(retryAfterFromMessage('try again in 1500 ms', now), 1_500)
   assert.equal(retryAfterFromMessage('slow down (~5s)', now), 5_000)
   assert.equal(retryAfterFromMessage('too many requests', now), undefined, '没写时间就不猜')
+})
+
+await check('并发上限：0 / 小数 / 负数都当「没设」，超过 16 收到 16', async () => {
+  assert.equal(concurrencyOf(0), undefined, '0 是「不限制」，不是「谁都不许用」')
+  assert.equal(concurrencyOf(-1), undefined)
+  assert.equal(concurrencyOf(2.5), undefined)
+  assert.equal(concurrencyOf('3'), undefined)
+  assert.equal(concurrencyOf(undefined), undefined)
+  assert.equal(concurrencyOf(1), 1)
+  assert.equal(concurrencyOf(MAX_CONCURRENCY), MAX_CONCURRENCY)
+  assert.equal(concurrencyOf(MAX_CONCURRENCY + 99), MAX_CONCURRENCY)
+})
+
+await check('并发记账：按会话算座位，同一个会话重入只占一格', async () => {
+  const key = routeKey('alpha', 'one')
+  const table = new Concurrency({ now: () => 1_000 })
+  assert.equal(table.usable(key, 2, 's1'), true, '没人占')
+  assert.equal(table.acquire(key, 2, 's1'), true)
+  assert.equal(table.used(key), 1)
+  assert.equal(table.usable(key, 2, 's1'), true, '自己占着也算能用（换账号重发不该被自己挡住）')
+  assert.equal(table.usable(key, 2, 's2'), true, '还有一格')
+  table.acquire(key, 2, 's2')
+  assert.equal(table.used(key), 2)
+  assert.equal(table.usable(key, 2, 's3'), false, '满了')
+  table.acquire(key, 2, 's1')
+  assert.equal(table.used(key), 2, '重入不占新座位')
+  table.release(key, 2, 's1')
+  assert.equal(table.used(key), 2, '重入过就要释放两次才真的走')
+  table.release(key, 2, 's1')
+  assert.equal(table.used(key), 1)
+  assert.equal(table.holds(key, 's1'), false)
+  assert.deepEqual(table.holders(key), ['s2'], '先来的排前面')
+  table.release(key, 2, 's2')
+  assert.equal(table.used(key), 0)
+  // 没设上限的候选根本不记账。
+  assert.equal(table.acquire(key, undefined, 's9'), false)
+  assert.equal(table.used(key), 0)
+})
+
+await check('并发上限：别的会话占着就跳过它，会话顺着队列往下走', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')], [betaKey, ok('beta 顶上')]]),
+  })
+  h.limits.acquire(alphaKey, 1, 'other')
+
+  const chunks = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [betaKey], 'alpha 被占满，这一趟该直接找 beta')
+  assert.equal(textOf(chunks), 'beta 顶上')
+})
+
+await check('并发上限：还有余量就照用，不因为「有人在用」就让位', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 2 }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')]]),
+  })
+  h.limits.acquire(alphaKey, 2, 'other')
+
+  const chunks = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey], '上限 2、只占了一格，应该照用')
+  assert.equal(textOf(chunks), 'alpha 说话')
+  assert.equal(h.limits.used(alphaKey), 1, '自己跑完就该把那一格还回去')
+  assert.equal(h.limits.holds(alphaKey, 's1'), false)
+  assert.equal(h.limits.holds(alphaKey, 'other'), true, '别人的占用不该被自己顺手清掉')
+})
+
+await check('并发上限：换人的时候，前面被别的会话放出来的模型会被拉回来顶替', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const spareKey = routeKey('alpha', 'two')
+  const betaKey = routeKey('beta', 'one')
+  let h
+  const scripts = new Map([
+    [alphaKey, async function* () {
+      // 就在这一趟跑着的时候，别的会话把排在前面的那个（设了上限的）放出来了。
+      h.limits.release(spareKey, 1, 'other')
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'alpha 挂了' } } }
+    }],
+    [spareKey, ok('备用的顶上')],
+    [betaKey, ok('beta 顶上')],
+  ])
+  h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one', concurrency: 1 },
+      { provider: 'alpha', model: 'two', concurrency: 1 },
+      { provider: 'beta', model: 'one' },
+    ],
+    scripts,
+  })
+  h.limits.acquire(spareKey, 1, 'other')
+
+  const chunks = await drain(runS1(h))
+  const seen = commands(h.llm)
+  assert.equal(seen.includes(betaKey), false, `放出来的模型排在 beta 前面，就该用它：${JSON.stringify(seen)}`)
+  assert.equal(seen.at(-1), spareKey, `最后一个该是它：${JSON.stringify(seen)}`)
+  assert.equal(textOf(chunks), '备用的顶上')
+  assert.equal(h.limits.holds(alphaKey, 's1'), false, 'alpha 失败收工也要把座位还回去')
+})
+
+await check('并发上限：自己刚用过的候选被放出来也不回头', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  let h
+  const scripts = new Map([
+    [alphaKey, async function* () {
+      // alpha 自己就是那个「设了上限的」—— 它在失败的同时把自己的座位还了，
+      // 换到下一个之后不该因此又把它捡回来重试。
+      h.limits.release(alphaKey, 1, 's1')
+      yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'alpha 挂了' } } }
+    }],
+    [betaKey, ok('beta 顶上')],
+  ])
+  h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }, { provider: 'beta', model: 'one' }],
+    scripts,
+  })
+
+  await drain(runS1(h))
+  const seen = commands(h.llm)
+  const firstBeta = seen.indexOf(betaKey)
+  assert.ok(firstBeta > 0, `alpha 该先被试：${JSON.stringify(seen)}`)
+  assert.equal(
+    seen.slice(firstBeta).includes(alphaKey),
+    false,
+    `换到 beta 之后不该再回头打 alpha：${JSON.stringify(seen)}`,
+  )
+})
+
+await check('并发上限：全队都被占满时不硬闯，也不隔离任何人', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }, { provider: 'beta', model: 'one', concurrency: 1 }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')], [betaKey, ok('beta 说话')]]),
+  })
+  h.limits.acquire(alphaKey, 1, 'other')
+  h.limits.acquire(betaKey, 1, 'other')
+
+  const chunks = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [], '一个都不该打，硬闯只会撞出假故障')
+  assert.equal(finishOf(chunks)?.reason?.kind, 'error')
+  assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0, '「没空位」不是模型的错，谁都不该被隔离')
+  // 放开一个之后下一趟就能用了。
+  h.limits.release(alphaKey, 1, 'other')
+  const again = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey])
+  assert.equal(textOf(again), 'alpha 说话')
 })
 
 await check('红绿计数：失败一次记一次、成功一次记一次，跨会话合计', async () => {

@@ -71,10 +71,8 @@ window.__ModuleLoader__.load({
 /* 队列行外面再包一层竖排容器：右键弹出来的「上下文窗口」小窗要长在行下面。 */
 .mf-qrow { display: flex; flex-direction: column; }
 .mf-row:hover { background: color-mix(in srgb, currentColor 6%, transparent); }
-/* 排序靠拖：这一行整体都是把手。左边那个 ⠿ 只是把「可以拖」这件事说出口。 */
+/* 排序靠拖：这一行整体都是把手，不再额外画一个「可以拖」的字符。 */
 .mf-row[draggable='true'] { cursor: grab; }
-.mf-grip { flex: none; cursor: grab; opacity: .35; user-select: none; font-size: 13px; line-height: 1; }
-.mf-row:hover .mf-grip { opacity: .6; }
 /* 正被拖走的那一行淡下去，落点那一行顶上画一条线。 */
 .mf-row.mf-drag-src { opacity: .4; }
 .mf-row.mf-drop { box-shadow: inset 0 2px 0 currentColor; }
@@ -122,6 +120,12 @@ window.__ModuleLoader__.load({
 .mf-select { flex: 1; }
 .mf-effort { flex: none; max-width: 150px; }
 .mf-effort-none { flex: none; opacity: .45; font-size: 11.5px; }
+/* 并发上限输入框：比思考强度窄，挤在它左边。 */
+.mf-limit { flex: none; width: 58px; text-align: center; font-variant-numeric: tabular-nums; }
+.mf-limit::placeholder { opacity: .5; }
+/* 「用着几个/上限」小胶囊：占满了变红（那是它被跳过的原因）。 */
+.mf-cap { flex: none; border: 1px solid color-mix(in srgb, currentColor 28%, transparent); border-radius: 5px; padding: 0 4px; font-size: 11px; font-variant-numeric: tabular-nums; opacity: .8; }
+.mf-cap-full { border-color: #e5484d; color: #e5484d; opacity: 1; }
 .mf-input { flex: 1; }
 .mf-num { width: 72px; }
 .mf-opt { display: flex; align-items: center; gap: 10px; }
@@ -142,9 +146,10 @@ window.__ModuleLoader__.load({
 .mf-qv-head > .mf-title { flex: 1; font-size: 14px; }
 .mf-qv-session { border: 1px solid color-mix(in srgb, currentColor 14%, transparent); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 6px; }
 .mf-qv-session.mf-mine { border-color: color-mix(in srgb, #30a46c 45%, transparent); }
-.mf-qv-top { display: flex; align-items: baseline; gap: 8px; }
+/* 会话号现在是完整的 session-<uuid>，窄栏里放不下就换行，不截。 */
+.mf-qv-top { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .mf-qv-title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.mf-qv-id { flex: none; opacity: .45; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.mf-qv-id { flex: none; opacity: .45; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 .mf-qv-clear { flex: none; font-size: 11.5px; padding: 1px 8px; }
 .mf-qv-line { display: flex; align-items: baseline; gap: 8px; }
 .mf-qv-label { flex: none; width: 4.5em; opacity: .55; font-size: 11.5px; }
@@ -160,6 +165,9 @@ window.__ModuleLoader__.load({
 /* 输出速度：蓝框蓝字，紧跟在模型名后面。跟红/绿胶囊并排，一眼分清「今天行不行」
    和「用起来多快」是两个问题。 */
 .mf-speed { flex: none; border: 1px solid #4c9aff; color: #4c9aff; border-radius: 5px; padding: 0 4px; font-size: 11px; font-variant-numeric: tabular-nums; }
+/* 「这个模型被用了多久」。正在跑的那一个会一秒一跳，加个底色好认。 */
+.mf-time { flex: none; color: #4c9aff; border-radius: 5px; padding: 0 4px; font-size: 11px; font-variant-numeric: tabular-nums; }
+.mf-time-live { border: 1px solid color-mix(in srgb, #4c9aff 45%, transparent); }
 /* 删除模板的二次确认：紧贴在那颗 ✕ 下面，而不是弹一个覆盖全屏的对话框 ——
    误点的场景里，视线还在这一行，确认就该长在这一行。 */
 .mf-confirm { display: flex; flex-direction: column; gap: 6px; margin: 2px 8px 6px 38px; padding: 8px 10px; border-radius: 8px; border: 1px solid color-mix(in srgb, #e5484d 45%, transparent); background: color-mix(in srgb, #e5484d 8%, transparent); font-size: 12px; }
@@ -233,6 +241,11 @@ window.__ModuleLoader__.load({
         effortHint: '「默认档位」＝这个模型平时的档位（不指定）；档位表由模型自己提供。',
         queueEmpty: '队列是空的。从下面挑一个模型加进来，或者点「重新扫描」。',
         gripHint: '按住拖动，改这条队列的顺序',
+        limitPlaceholder: '不限',
+        limitHint: '这个上游同时最多收几个请求。留空＝不限制；填了之后，每有一个会话正在用它就占掉一格，占满了别的会话会跳过它去用队列里的下一个。',
+        capLabel: '{used}/{cap}',
+        capHint: '几个会话正在用它 / 上限。没占满时别的会话还能进来。',
+        capFullHint: '已经占满了，别的会话这一趟会跳过它去用队列里的下一个；等某一趟收工就会空出来。',
         windowSize: '上下文窗口',
         windowCompressAt: '压缩触发点',
         windowUnknown: '未知',
@@ -344,6 +357,11 @@ window.__ModuleLoader__.load({
         qvDay: '当前逻辑日 {day}',
         qvSpeedHint: '本会话累计跑出 {tokens} 个输出 token，扣掉排队和首字延迟后用了 {ms} 毫秒',
         qvSpeedHintRuns: '本会话累计 {runs} 趟、共 {tokens} 个输出 token，扣掉排队和首字延迟后用了 {ms} 毫秒',
+        qvTimeHint: '这个模型一共被用了多久（{text}）：从第一个 token 算到收工，跨趟累计。',
+        qvTimeLiveHint: '此刻正在用它：已经用了 {text}，还在往上涨。',
+        qvCapped: '并发限制',
+        qvCapHint: '这个模型设了并发上限：现在有 {used} 个会话在用它，上限 {cap}。还有空位时别的会话照用。',
+        qvCapFullHint: '这个模型已经占满（{used}/{cap}），别的会话这一趟会跳过它去用队列里的下一个；某一趟收工就会空出来。',
         qvTemplate: '模板「{name}」',
         templateDeleteConfirm: '确定删掉模板「{name}」吗？队列里的 {count} 个模型会一起消失。',
         templateDeleteYes: '删掉',
@@ -412,6 +430,11 @@ window.__ModuleLoader__.load({
         effortHint: '"Default effort" keeps the model’s own level (nothing is specified); the levels come from the model itself.',
         queueEmpty: 'The queue is empty. Add a model below, or press Rescan.',
         gripHint: 'Drag to reorder this queue',
+        limitPlaceholder: 'off',
+        limitHint: 'How many requests this upstream accepts at once. Leave it empty for no limit; once set, each conversation using it takes a slot, and when it is full other conversations skip it and take the next model in the queue.',
+        capLabel: '{used}/{cap}',
+        capHint: 'Conversations using it / the limit. Others can still join while a slot is free.',
+        capFullHint: 'Full right now — other conversations skip it and take the next model in the queue. A slot frees up as soon as one call finishes.',
         windowSize: 'Context window',
         windowCompressAt: 'Compaction trigger',
         windowUnknown: 'Unknown',
@@ -523,6 +546,11 @@ window.__ModuleLoader__.load({
         qvDay: 'Logical day {day}',
         qvSpeedHint: 'This conversation produced {tokens} output tokens in {ms} ms, excluding queueing and time to first token',
         qvSpeedHintRuns: 'This conversation ran {runs} times for {tokens} output tokens in {ms} ms, excluding queueing and time to first token',
+        qvTimeHint: 'How long this model has been used in total ({text}): from the first token to the end of each call, across runs.',
+        qvTimeLiveHint: 'Running right now: {text} so far and still counting.',
+        qvCapped: 'Concurrency',
+        qvCapHint: 'This model has a concurrency limit: {used} conversation(s) using it now, limit {cap}. Others still join while a slot is free.',
+        qvCapFullHint: 'This model is full ({used}/{cap}). Other conversations skip it and take the next model in the queue; a slot frees up when one call finishes.',
         qvTemplate: 'template “{name}”',
         templateDeleteConfirm: 'Delete the template “{name}”? Its {count} models go with it.',
         templateDeleteYes: 'Delete',
@@ -899,6 +927,28 @@ window.__ModuleLoader__.load({
       )
 
       /**
+       * 并发上限的硬上界 —— 由宿主下发（`GET /state` 的 `maxConcurrency`），
+       * 拿不到时退回 16。输入框的 `max` 和 `setLimit` 都用它，两边同源。
+       */
+      const maxConcurrency = Number.isInteger(state?.maxConcurrency) && state.maxConcurrency > 0
+        ? state.maxConcurrency
+        : 16
+
+      /**
+       * 每个候选此刻被几个会话占着：`key -> {cap, used, holders}`。
+       *
+       * 上限是用户设的（跟着模板落盘），占用是宿主内存里的实时账 —— 队列行
+       * 上给一个小标签，说明「它为什么被跳过」，也说明「我设的上限生效了没」。
+       */
+      const limitInfo = useMemo(() => {
+        const map = new Map()
+        for (const row of state?.limits ?? []) {
+          if (typeof row.key === 'string') map.set(row.key, row)
+        }
+        return map
+      }, [state])
+
+      /**
        * 正在限流冷却里的模型：`key -> 还要等多少毫秒`。
        *
        * 和隔离是两件事：隔离是「今天别指望它」，冷却只是「过几十秒再来」。
@@ -1002,6 +1052,30 @@ window.__ModuleLoader__.load({
         })
         mutateOrder(next)
       }, [order, mutateOrder])
+
+      /**
+       * 给队列里某一项设置**并发上限**；`''` 表示不限制（默认）。
+       *
+       * 它是「这个上游同时收得下几个请求」，所以跟着候选一起走、跟着模板落盘；
+       * 但**占用**只在宿主内存里，界面看到的实时占用来自 `GET /state` 的
+       * `limits` 一栏。这里只管把这一个数字写回去。
+       */
+      const setLimit = useCallback((index, value) => {
+        const next = order.map((item, at) => {
+          if (at !== index) return item
+          const base = { provider: item.provider, model: item.model }
+          if (item.reasoningEffort !== undefined) base.reasoningEffort = item.reasoningEffort
+          if (item.contextWindow !== undefined) base.contextWindow = item.contextWindow
+          const text = String(value ?? '').trim()
+          if (text === '') return base
+          const number = Number(text)
+          // 只接受正整数；别的一律当「没设」，免得半截输入（比如刚敲了一个 `-`）
+          // 把整条队列写坏。
+          if (!Number.isInteger(number) || number <= 0) return base
+          return { ...base, concurrency: Math.min(number, maxConcurrency ?? 16) }
+        })
+        mutateOrder(next)
+      }, [order, mutateOrder, maxConcurrency])
 
       const add = useCallback(() => {
         if (addKey === '') return
@@ -1501,8 +1575,7 @@ window.__ModuleLoader__.load({
                   },
                   onDragEnd: stopDrag,
                 },
-                  span({ className: 'mf-grip', title: t('gripHint'), 'data-role': 'queue-grip' }, '⠿'),
-                  span({ className: 'mf-idx' }, String(index + 1)),
+                  span({ className: 'mf-idx', title: t('gripHint') }, String(index + 1)),
                   // 今天这个模型在全机器上失败了几次、成了几次。红的是失败、绿的是
                   // 成功 —— 它是**统计**，不是隔离状态：隔离按「会话 × 模板」算，
                   // 一行一个模型答不了「在我这个会话里能不能用」。
@@ -1510,6 +1583,20 @@ window.__ModuleLoader__.load({
                     span({ className: 'mf-fail', title: t('failCountHint') }, String(tally?.fail ?? 0)),
                     span({ className: 'mf-good', title: t('goodCountHint') }, String(tally?.ok ?? 0)),
                   ),
+                  // 设了并发上限的候选才画：`用着几个/上限`。占满了就变红——那正是
+                  // 它这一趟会被跳过的原因，得让用户看得见，否则「排第一却没人用」
+                  // 看起来就像坏了。
+                  (() => {
+                    const cap = Number.isInteger(item.concurrency) ? item.concurrency : undefined
+                    if (cap === undefined) return null
+                    const used = limitInfo.get(key)?.used ?? 0
+                    const full = used >= cap
+                    return span({
+                      className: full ? 'mf-cap mf-cap-full' : 'mf-cap',
+                      'data-role': 'queue-cap',
+                      title: full ? t('capFullHint') : t('capHint'),
+                    }, t('capLabel', { used, cap }))
+                  })(),
                   div({ className: 'mf-main' },
                     div({ className: 'mf-name' },
                       span({ className: 'mf-name-text' }, hit?.name ?? item.model),
@@ -1533,6 +1620,23 @@ window.__ModuleLoader__.load({
                     ),
                     div({ className: 'mf-sub' }, `${hit?.providerName ?? item.provider} · ${item.model}`),
                   ),
+                  // 并发上限：这个上游同时收得下几个请求。留空 = 不限制（默认），
+                  // 填了就按会话占座位 —— 占满了别的会话会跳过它。所以它紧挨着
+                  // 思考强度、跟这个候选自己的属性放在一起。
+                  h('input', {
+                    className: 'mf-input mf-limit',
+                    type: 'number',
+                    name: 'concurrency',
+                    min: '1',
+                    max: String(maxConcurrency ?? 16),
+                    step: '1',
+                    placeholder: t('limitPlaceholder'),
+                    title: t('limitHint'),
+                    'data-role': 'queue-limit',
+                    value: item.concurrency === undefined ? '' : String(item.concurrency),
+                    disabled: busy,
+                    onChange: (event) => setLimit(index, event.target.value),
+                  }),
                   // 思考强度：档位表来自模型自己（resolveModelInfo 的 reasoning），
                   // 所以画出来的就是用户在模型设置页直接选它时看到的那几档。
                   // 还没问到档位表时先给一个禁用态，不要凭空造几个档位出来。
@@ -2092,9 +2196,14 @@ window.__ModuleLoader__.load({
       return '?'
     }
 
-    /** 会话号太长了，列表里只留前 8 位。 */
-    function shortId(sessionId) {
-      return typeof sessionId === 'string' && sessionId.length > 8 ? sessionId.slice(0, 8) : String(sessionId ?? '')
+    /**
+     * 会话号**原样显示**。
+     *
+     * 早先这里截前 8 位，可会话号是 `session-<uuid>` 的形状 —— 前 8 位正好是
+     * `session-` 这一截固定前缀，等于什么都没显示。要认哪个会话，就得看全。
+     */
+    function fullId(sessionId) {
+      return String(sessionId ?? '')
     }
 
     /**
@@ -2121,6 +2230,23 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 把一段毫秒写成给人看的时长：`8.4s` / `42s` / `3m 07s` / `1h 12m`。
+     *
+     * 十秒以内留一位小数 —— 这一栏里最短的那些趟往往就几秒，抹成整数看不出
+     * 「刚才那一趟是 2 秒还是 9 秒」。
+     */
+    function formatDuration(ms) {
+      const safe = Number.isFinite(ms) && ms > 0 ? ms : 0
+      if (safe < 10_000) return `${(safe / 1000).toFixed(1)}s`
+      const total = Math.round(safe / 1000)
+      if (total < 60) return `${total}s`
+      const minutes = Math.floor(total / 60)
+      const seconds = total % 60
+      if (minutes < 60) return `${minutes}m ${String(seconds).padStart(2, '0')}s`
+      return `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, '0')}m`
+    }
+
+    /**
      * 一栏里的一行会话。
      *
      * `useSessions` 由宿主以标准 hook 属性注入（dsh-client-ui-session 的
@@ -2128,9 +2254,11 @@ window.__ModuleLoader__.load({
      * 拿不到时退回会话号前缀 —— 这一栏是给人看「哪个会话出事了」，标题只是
      * 帮助识别，缺了也不能空白。
      */
-    function SessionQueueRow({ row, mine, title, t, templateName, onClear, busy, onCopyError, copiedKey }) {
+    function SessionQueueRow({ row, mine, title, t, templateName, onClear, busy, onCopyError, copiedKey, nowMs }) {
       const quarantined = row?.quarantined ?? []
       const good = row?.good ?? []
+      /** 这个会话的模板里，设了并发上限的那些候选（占用是宿主内存里的实时账）。 */
+      const capped = row?.capped ?? []
       const active = row?.active
       const activeTemplate = typeof active?.templateName === 'string' && active.templateName !== ''
         ? active.templateName
@@ -2153,15 +2281,43 @@ window.__ModuleLoader__.load({
             : t('qvSpeedHintRuns', { tokens: item.speed.tokens, ms: Math.round(item.speed.ms), runs }),
         }, text)
       }
-      // 此刻正在跑：这一栏要能一眼看出「有人在写字」，因为速度数字只在每一趟
-      // 结束时才跳一下，中间那几十秒光看数字是看不出还在跑的。
+
+      // 此刻正在跑的那个（有就说明有人在写字）。下面的时间小框要用它。
       const running = row?.running
+      /** 「当前」那一行报的是谁：正在跑的优先，没有就是上一趟跑过的。 */
+      const currentItem = running ?? active
+
+      /**
+       * 「这个模型被用了多久」。
+       *
+       * 口径与速度小框同源（都是从第一个 token 到收工的生成时长、跨趟累计），
+       * 多出来的只有一种情况：**此刻正在跑的那一个**，它这一段还没结束，所以
+       * 要把「已经跑了多久」加上去 —— 这就是「正在使用的模型的时间也要逐步增加
+       * 显示」。加的那一段靠外面每秒跳一次的 `nowMs` 驱动。
+       */
+      const timeChip = (item) => {
+        const mineRunning = running !== undefined
+          && String(running.provider ?? '') === String(item?.provider ?? '')
+          && String(running.model ?? '') === String(item?.model ?? '')
+          && (running.templateId ?? undefined) === (item?.templateId ?? undefined)
+        const base = Number.isFinite(item?.speed?.ms) && item.speed.ms > 0 ? item.speed.ms : 0
+        const live = mineRunning ? Math.max(0, Number(nowMs) - Number(running.at ?? nowMs)) : 0
+        const ms = base + live
+        if (ms <= 0) return null
+        return span({
+          className: live > 0 ? 'mf-time mf-time-live' : 'mf-time',
+          'data-role': 'usage-time',
+          title: live > 0
+            ? t('qvTimeLiveHint', { text: formatDuration(ms) })
+            : t('qvTimeHint', { text: formatDuration(ms) }),
+        }, formatDuration(ms))
+      }
       return div({ className: mine ? 'mf-qv-session mf-mine' : 'mf-qv-session' },
         div({ className: 'mf-qv-top' },
           span({ className: 'mf-qv-title' }, title === undefined || title === '' ? t('qvUnnamed') : title),
           running === undefined ? null : span({ className: 'mf-badge mf-run' }, t('qvRunning')),
           mine ? span({ className: 'mf-badge mf-ok' }, t('qvCurrent')) : null,
-          span({ className: 'mf-qv-id' }, shortId(row?.sessionId)),
+          span({ className: 'mf-qv-id' }, fullId(row?.sessionId)),
           // 解除按钮就在这一行上：解哪个会话的隔离，按钮长在哪个会话上最没歧义。
           // 没有隔离就点不动 —— 灰着比按下去什么也不发生更好懂。
           h('button', {
@@ -2184,6 +2340,9 @@ window.__ModuleLoader__.load({
             : (active === undefined
                 ? t('none')
                 : `${sessionItemLabel(active)}${activeTemplate === undefined ? '' : ` · ${t('qvTemplate', { name: activeTemplate })}`}`)),
+          // 「当前」这一行也要有时间：正在跑的那一个只在实时表里，未必同时出现在
+          // 下面「已验证」的名单里 —— 漏了这里，用户就看不到它逐秒往上涨。
+          currentItem === undefined ? null : timeChip(currentItem),
         ),
         div({ className: 'mf-qv-line' },
           span({ className: 'mf-qv-label' }, t('qvQuarantined')),
@@ -2212,6 +2371,7 @@ window.__ModuleLoader__.load({
                       : span({ className: 'mf-qv-code' }, ` · ${templateName(item.templateId)}`),
                     span({ className: 'mf-qv-code' }, ` · ${codeText(item.code) || String(item.code ?? '?')} · ${stamp(item.at)}`),
                     speedChip(item),
+                    timeChip(item),
                     copied ? span({ className: 'mf-copied' }, t('qvCopied')) : null,
                   )
                 }),
@@ -2225,7 +2385,33 @@ window.__ModuleLoader__.load({
                 ...good.map((item) => h('span', {
                   className: 'mf-qv-item mf-ok',
                   key: `${item.key ?? ''}\u0000${item.templateId ?? ''}`,
-                }, sessionItemLabel(item), speedChip(item))),
+                }, sessionItemLabel(item), speedChip(item), timeChip(item))),
+              ),
+            ),
+        // 「并发限制」：这一栏只列**设了上限**的候选。它是用户自己配的一个小范围
+        // 事实（「这个上游同时收得下几个」），跟隔离、验证不在一条轴上，所以单开
+        // 一行 —— 没有任何上限时整行不画，不给空名单占地方。
+        capped.length === 0
+          ? null
+          : div({ className: 'mf-qv-line' },
+              span({ className: 'mf-qv-label' }, t('qvCapped')),
+              div({ className: 'mf-qv-list' },
+                ...capped.map((item) => {
+                  const used = Number.isFinite(item.used) ? item.used : 0
+                  const cap = Number.isFinite(item.cap) ? item.cap : 0
+                  const full = cap > 0 && used >= cap
+                  return h('span', {
+                    className: full ? 'mf-qv-item mf-bad' : 'mf-qv-item',
+                    key: item.key,
+                    'data-role': 'qv-cap',
+                    title: full
+                      ? t('qvCapFullHint', { used, cap })
+                      : t('qvCapHint', { used, cap }),
+                  },
+                    sessionItemLabel(item),
+                    span({ className: 'mf-qv-code' }, ` · ${t('capLabel', { used, cap })}`),
+                  )
+                }),
               ),
             ),
       )
@@ -2275,6 +2461,21 @@ window.__ModuleLoader__.load({
 
       // 有没有会话正在跑 —— 决定轮询快慢，也决定要不要在行上挂「运行中」。
       const running = (data?.sessions ?? []).some((row) => row?.running !== undefined)
+
+      /**
+       * 正在跑的那个模型的「已用时长」要一秒一跳。
+       *
+       * 轮询最快也是几秒一次，光靠它数字会一顿一顿的，看着像卡住；这个本地
+       * 定时器只负责让画面重画，时间本身是拿 `Date.now()` 现算的。
+       * 没人在跑就不开 —— 这一栏大部分时间没人盯着，白跳没有意义。
+       */
+      const [nowMs, setNowMs] = useState(() => Date.now())
+      useEffect(() => {
+        if (!running) return undefined
+        setNowMs(Date.now())
+        const timer = setInterval(() => setNowMs(Date.now()), 1_000)
+        return () => clearInterval(timer)
+      }, [running])
 
       useEffect(() => {
         alive.current = true
@@ -2431,6 +2632,7 @@ window.__ModuleLoader__.load({
                 onClear: (sessionId) => void clearOne(sessionId),
                 onCopyError: (item, chipKey) => void copyError(item, chipKey),
                 copiedKey: copied,
+                nowMs,
               })),
       )
     }

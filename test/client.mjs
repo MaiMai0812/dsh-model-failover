@@ -1285,6 +1285,127 @@ await check('隔离队列：没有隔离的会话，它那一行的解除按钮�
   assert.equal(buttons[1].props.disabled, false, '有隔离的那个会话应当能按')
 })
 
+// ── 会话号、使用时长、并发上限这三样在会话页上的呈现 ──────────────────────────
+
+/** 会话页上带 `data-role` 的小框，按渲染顺序。 */
+const roleChips = (role, rt) => rt.nodes.filter(
+  (node) => node.props?.['data-role'] === role && node.props?.className !== undefined,
+)
+
+/** 一个会话数据 + 一份已经测过速的「已验证」名单。 */
+const timedRow = (overrides) => sessionRow({
+  sessionId: 'session-a556ae8f-4f31-4881-b74d-6dad36d06628',
+  quarantined: [],
+  good: [{
+    key: KEY('beta', 'one'),
+    provider: 'beta',
+    model: 'one',
+    at,
+    templateId: 'default',
+    speed: { tokens: 1_200, ms: 24_000, runs: 2, at },
+  }],
+  ...overrides,
+})
+
+await check('隔离队列：会话号给完整的，不再只给前 8 位（那 8 位正好是 session-）', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([timedRow({})])
+  let ids
+  try {
+    await fresh.mount(queue({ sessionId: 'other', t }))
+    ids = fresh.nodes.filter((node) => String(node.props?.className ?? '') === 'mf-qv-id')
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(ids.length, 1, '一个会话框一个会话号')
+  assert.equal(ids[0].text, 'session-a556ae8f-4f31-4881-b74d-6dad36d06628', `应当给完整会话号，实际：${ids[0].text}`)
+  assert.equal(ids[0].text.startsWith('session-') && ids[0].text.length === 8, false, '不该只留前 8 位')
+})
+
+await check('隔离队列：已验证的模型后面跟一个蓝色的使用时长', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([timedRow({})])
+  let chips
+  try {
+    await fresh.mount(queue({ sessionId: 'other', t }))
+    chips = roleChips('usage-time', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  // 「当前」那一行走的是宿主便签（没有测速数据），所以没在跑的时候只有
+  // 「已验证」那一颗会画出来。
+  assert.equal(chips.length, 1, `没在跑时只有已验证那一颗，实际 ${chips.length} 个`)
+  for (const chip of chips) {
+    assert.ok(String(chip.props.className).includes('mf-time'), '要用蓝色小框那套样式')
+    assert.equal(String(chip.props.className).includes('mf-time-live'), false, '没在跑就不该标成实时')
+    assert.match(chip.text, /^24(\.0)?s$/, `显示的应当是累计出来的时长，实际：${chip.text}`)
+  }
+})
+
+await check('隔离队列：正在跑的那个标成实时——它的时长从这一趟开工算起，会往上涨', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([timedRow({
+    // 上一趟在 beta 上攒了 24 秒；此刻又轮到 beta 在跑，已经跑了 5 秒。
+    running: { provider: 'beta', model: 'one', at: Date.now() - 5_000, label: 'Code99 · Beta One', templateId: 'default' },
+  })])
+  let chips
+  try {
+    await fresh.mount(queue({ sessionId: 'other', t }))
+    chips = roleChips('usage-time', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  const live = chips.filter((chip) => String(chip.props.className).includes('mf-time-live'))
+  assert.equal(live.length >= 1, true, `正在跑的那一处要标成实时，实际：${chips.map((c) => c.props.className).join(' / ')}`)
+  assert.equal(
+    live[0].props.title.includes('还在往上涨'),
+    true,
+    `实时那一条的悬停说明应当说「还在涨」，实际：${live[0].props.title}`,
+  )
+})
+
+await check('隔离队列：「并发限制」一栏只列设了上限的模型，并报出占用', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([timedRow({
+    capped: [
+      { key: KEY('beta', 'one'), cap: 2, used: 2, holders: ['s1', 's2'], provider: 'beta', model: 'one', label: 'Code99 · Beta One' },
+      { key: KEY('gamma', 'two'), cap: 3, used: 1, holders: ['s1'], provider: 'gamma', model: 'two', label: 'FutureHub · Gamma Two' },
+    ],
+  })])
+  let chips
+  let flat
+  try {
+    await fresh.mount(queue({ sessionId: 'other', t }))
+    chips = roleChips('qv-cap', fresh)
+    flat = fresh.text(fresh.nodes.find((node) => String(node.props?.className ?? '').includes('mf-qv')) ?? fresh.nodes[0])
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(chips.length, 2, '设了两个上限就画两颗')
+  assert.equal(String(chips[0].props.className).includes('mf-bad'), true, '占满的那颗要标红')
+  assert.equal(String(chips[1].props.className).includes('mf-bad'), false, '还有空位的不标红')
+  assert.equal(chips[0].props.title.includes('已经占满'), true, `占满的走「已经占满」的悬停文案，实际：${chips[0].props.title}`)
+  assert.equal(chips[1].props.title.includes('还有空位'), true, `没占满的要说清还有空位，实际：${chips[1].props.title}`)
+})
+
+await check('隔离队列：没有任何模型设并发上限时，「并发限制」那一行整个不画', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([sessionRow({})])
+  let chips
+  try {
+    await fresh.mount(queue({ sessionId: 'other', t }))
+    chips = roleChips('qv-cap', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(chips.length, 0, '没配上限就不该给这一栏占地方')
+})
+
 // ── 首帧 / 错误态（各自一个全新的渲染器，避免和别的用例串味） ────────────────
 
 const page = sections[0].component
@@ -1333,13 +1454,19 @@ globalThis.fetch = async (url, init = {}) => {
   if (method === 'POST') {
     if (String(url).endsWith('/settings') && body !== undefined) {
       if (Array.isArray(body.templates)) {
-        // 模拟宿主 normalizeTemplates：只留 id/name/order，档位只保留真正设了的。
+        // 模拟宿主 normalizeTemplates/normalizeCandidates：只留真正设了的键。
+        // 这里必须跟着宿主一起长 —— 漏掉一个键，改设置的那条用例就会「POST 里
+        // 有、回显里没有」，看着像客户端没生效，其实是替身落在后面了。
         current.settings.templates = body.templates.map((template) => ({
           id: template.id,
           name: template.name,
-          order: (template.order ?? []).map((item) => (item.reasoningEffort === undefined
-            ? { provider: item.provider, model: item.model }
-            : { provider: item.provider, model: item.model, reasoningEffort: item.reasoningEffort })),
+          order: (template.order ?? []).map((item) => {
+            const entry = { provider: item.provider, model: item.model }
+            if (typeof item.reasoningEffort === 'string' && item.reasoningEffort.trim() !== '') entry.reasoningEffort = item.reasoningEffort
+            if (Number.isInteger(item.contextWindow) && item.contextWindow > 0) entry.contextWindow = item.contextWindow
+            if (Number.isInteger(item.concurrency) && item.concurrency > 0) entry.concurrency = item.concurrency
+            return entry
+          }),
         }))
       }
       if (typeof body.editedTemplate === 'string') current.settings.editedTemplate = body.editedTemplate
@@ -1480,6 +1607,49 @@ await check('把档位改回「默认档位」：这一项不再带 reasoningEff
  * 假 DOM 不会自己发 drag 事件，所以直接调 props 上的那几个回调 —— 它们就是
  * 真实浏览器会调的那几个。`dataTransfer` 用一个只记账的替身。
  */
+// ── 队列行上的并发上限输入框（原来那六个盲文点让位给它） ──────────────────────
+
+/** 队列行上的并发上限输入框，按渲染顺序。 */
+const limitInputs = (rt = runtime) => rt.nodes.filter((node) => node.props?.['data-role'] === 'queue-limit')
+
+await check('队列行不再画拖拽那六个点，改成并发上限的输入框', () => {
+  const grips = runtime.nodes.filter((node) => node.text === '⠿')
+  assert.equal(grips.length, 0, `那六个盲文点该撤掉，实际还有 ${grips.length} 个`)
+  const inputs = limitInputs()
+  assert.equal(inputs.length, 3, '三个候选各有一个输入框')
+  assert.equal(inputs[0].props.name, 'concurrency', '要有 name，测试与别的工具才认得出来')
+  assert.equal(inputs[0].props.type, 'number')
+  assert.equal(inputs[0].props.max, '16', '没拿到宿主下发的上界时用 16')
+  assert.equal(inputs[0].props.value, '', '默认不限制：框子是空的')
+})
+
+await check('并发上限：填了数字就只写进那一项，原来的档位不动', async () => {
+  const before = requests.length
+  await limitInputs()[0].props.onChange({ target: { value: '2' } })
+  await runtime.mount(page(props))
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.equal(posts.length, 1, '应只发一个 POST')
+  assert.deepEqual(posts[0].body.templates[0].order, [
+    { provider: 'alpha', model: 'one', concurrency: 2 },
+    { provider: 'beta', model: 'one' },
+    { provider: 'gamma', model: 'two' },
+  ], '只给那一项加 concurrency，别人的键一个都不许多')
+  assert.equal(limitInputs()[0].props.value, '2', '控件显示宿主确认下来的值')
+})
+
+await check('并发上限：清空就表示不限制，这一项不再带 concurrency', async () => {
+  const before = requests.length
+  await limitInputs()[0].props.onChange({ target: { value: '' } })
+  await runtime.mount(page(props))
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.equal(posts.length, 1, '应只发一个 POST')
+  assert.deepEqual(
+    posts[0].body.templates[0].order[0],
+    { provider: 'alpha', model: 'one' },
+    '清空是把 concurrency 去掉，不是写 0 —— 0 会被读成「谁都不许用」',
+  )
+})
+
 const queueRows = () => runtime.nodes.filter((node) => node.props?.['data-role'] === 'queue-row')
 const dragEvent = (tagName = 'DIV') => ({
   target: { tagName },
