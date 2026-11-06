@@ -320,6 +320,8 @@ const initialState = () => ({
     sameModelRetries: 2,
     idleTimeoutSec: 120,
     cooldownSec: 60,
+    // 并发上限的收工冷却：默认 5 秒（产品默认值，用例里就当宿主原样给的）。
+    limitCooldownSec: 5,
     continueText: '继续',
     hiddenProviders: ['qodercn'],
     retryWhenAllQuarantined: true,
@@ -1470,7 +1472,7 @@ globalThis.fetch = async (url, init = {}) => {
         }))
       }
       if (typeof body.editedTemplate === 'string') current.settings.editedTemplate = body.editedTemplate
-      for (const key of ['enabled', 'retrySameModelOnce', 'sameModelRetries', 'idleTimeoutSec', 'cooldownSec', 'continueText', 'resetHour', 'keepEventLog', 'eventLogLimit', 'retryWhenAllQuarantined', 'autoContinue', 'autoContinueOnFailure', 'autoContinueOnMaxTokens', 'autoContinueFailureLimit', 'autoContinueMaxTokensLimit', 'continueDelaySec', 'showSubagentSessions', 'showForeignSessions']) {
+      for (const key of ['enabled', 'retrySameModelOnce', 'sameModelRetries', 'idleTimeoutSec', 'cooldownSec', 'limitCooldownSec', 'continueText', 'resetHour', 'keepEventLog', 'eventLogLimit', 'retryWhenAllQuarantined', 'autoContinue', 'autoContinueOnFailure', 'autoContinueOnMaxTokens', 'autoContinueFailureLimit', 'autoContinueMaxTokensLimit', 'continueDelaySec', 'showSubagentSessions', 'showForeignSessions']) {
         if (body[key] !== undefined) current.settings[key] = body[key]
       }
       if (Array.isArray(body.hiddenProviders)) {
@@ -2160,8 +2162,10 @@ await check('DSH 异常：三个开关 + 两个分开的次数上限 + 等待秒
   assert.equal(failureLimitInput().props.value, '1', '失败上限应显示宿主的值')
   assert.equal(maxTokensLimitInput().props.value, '10', '撞上限的次数应显示宿主的值')
 
+  // 按 name 认人，不按「min 0 / max 300」认：并发收工冷却那行也是 0-300，
+  // 靠区间找会认错人（这正是加它的时候踩到的坑）。
   const delay = runtime.find(
-    (node) => node.tag === 'input' && node.props.min === 0 && node.props.max === 300,
+    (node) => node.tag === 'input' && node.props['data-name'] === 'continueDelay',
   )
   assert.equal(delay.props.value, '5', '等待秒数应显示宿主的值')
   assert.equal(delay.props.disabled, false)
@@ -2182,7 +2186,7 @@ await check('DSH 异常总开关关掉后，两个分项、两个上限和等待
   assert.equal(failureLimitInput().props.disabled, true)
   assert.equal(maxTokensLimitInput().props.disabled, true)
   const delay = runtime.find(
-    (node) => node.tag === 'input' && node.props.min === 0 && node.props.max === 300,
+    (node) => node.tag === 'input' && node.props['data-name'] === 'continueDelay',
   )
   assert.equal(delay.props.disabled, true, '总开关关了，等待秒数也没意义')
 
@@ -2331,7 +2335,7 @@ await check('隔离队列：开着「其他工作区」时两边的会话都在'
 
 await check('等待秒数失焦后 POST continueDelaySec，超范围夹到 0-300', async () => {
   const delayInput = () => runtime.find(
-    (node) => node.tag === 'input' && node.props.min === 0 && node.props.max === 300,
+    (node) => node.tag === 'input' && node.props['data-name'] === 'continueDelay',
   )
   const before = requests.length
   delayInput().props.onChange({ target: { value: '999' } })
@@ -2967,6 +2971,96 @@ await check('试连接：每个模板一颗按钮，点了逐个探这条队列�
   assert.deepEqual(badges.map((badge) => badge.text), ['通', '通', '不通'])
   assert.equal(badges[0].props.title, '30 毫秒收到回应')
   assert.equal(badges[2].props.title, 'QUOTA — 余额不足', '不通的那颗要说清是什么错')
+})
+
+await check('并发收工冷却：设置页有这一行，显示宿主的值，失焦按 0-300 提交', async () => {
+  const coolInput = () => runtime.find(
+    (node) => node.tag === 'input' && node.props['data-name'] === 'limitCooldownSec',
+  )
+  assert.equal(coolInput().props.value, '5', '默认 5 秒要显示出来')
+  assert.equal(coolInput().props.max, 300, '上界跟宿主一致')
+  // 置灰条件跟旁边那条「被限流后先绕开它多久」完全一样（忙于保存 / 插件关掉时）。
+  const cooldownInput = runtime.find(
+    (node) => node.tag === 'input' && node.props['data-name'] === 'cooldownSec',
+  )
+  assert.equal(coolInput().props.disabled, cooldownInput.props.disabled)
+
+  const before = requests.length
+  coolInput().props.onChange({ target: { value: '999' } })
+  await runtime.mount(page(props))
+  assert.equal(coolInput().props.value, '999', '还没失焦时保留草稿')
+  coolInput().props.onBlur()
+  await runtime.mount(page(props))
+
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.equal(posts.length, 1)
+  assert.deepEqual(posts[0].body, { limitCooldownSec: 300 }, '超范围要夹到 300，不是原样发出去')
+  assert.equal(current.settings.limitCooldownSec, 300, '存回去的值也该是夹过的')
+
+  // 0 是合法值（不歇），不能被当成「没填」弹回默认值。
+  const zeroBefore = requests.length
+  coolInput().props.onChange({ target: { value: '0' } })
+  await runtime.mount(page(props))
+  coolInput().props.onBlur()
+  await runtime.mount(page(props))
+  const zeroPosts = requests.slice(zeroBefore).filter((row) => row.method === 'POST')
+  assert.deepEqual(zeroPosts.map((row) => row.body), [{ limitCooldownSec: 0 }])
+
+  // 恢复成 5，后面的用例（以及「默认值」的语义）都按它走。
+  coolInput().props.onChange({ target: { value: '5' } })
+  await runtime.mount(page(props))
+  coolInput().props.onBlur()
+  await runtime.mount(page(props))
+})
+
+await check('并发收工冷却：正在歇的候选在队列行上写明还要歇几秒，也不当「下一个」', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = initialState()
+  // 这份 fixture 默认已经隔离了 beta/gamma；本用例只想验「收工冷却」这一条，
+  // 把别的排除理由先清空，免得起点回落到 order[0] 却看不出是它的原因。
+  state.quarantined = []
+  state.cooling = []
+  // 队列第一个（alpha one）限 1 个会话，刚收工、还要歇 5 秒。
+  state.limits = [{
+    key: KEY('alpha', 'one'), cap: 1, used: 0, holders: [], coolingMs: 5_000,
+    provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One',
+  }]
+  globalThis.fetch = async () => payloadResponse(state)
+  let nodes
+  let tree2
+  try {
+    tree2 = await fresh.mount(page({ close() {}, t }))
+    nodes = fresh.nodes
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  const tag = nodes.find((node) => node.props?.['data-role'] === 'limit-cooling')
+  assert.ok(tag, '正在歇的候选要有自己的标记')
+  assert.equal(tag.text, '收工歇 5 秒')
+  assert.ok(String(tag.props.title).includes('并发上限'), '悬停要说清是「我们让它歇的」，不是上游限流')
+
+  // 「当前起点」不能写一个正在歇的：alpha 在歇，就该说 beta。
+  const flat = fresh.text(tree2)
+  const pickIndex = flat.indexOf('当前起点')
+  const pickLine = pickIndex === -1 ? '' : flat.slice(pickIndex, pickIndex + 40)
+  assert.ok(pickLine.includes('Beta One'), `起点应是 beta，实际：${pickLine}`)
+
+  // 冷却过期（宿主不再报 coolingMs）之后就不该再有这颗标签。
+  const after = new Runtime()
+  const expired = initialState()
+  expired.limits = [{
+    key: KEY('alpha', 'one'), cap: 1, used: 0, holders: [], coolingMs: 0,
+    provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One',
+  }]
+  globalThis.fetch = async () => payloadResponse(expired)
+  try {
+    await after.mount(page({ close() {}, t }))
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(after.nodes.filter((node) => node.props?.['data-role'] === 'limit-cooling').length, 0)
 })
 
 await check('试连接：连不上时按钮仍是灰的，不给点空队列', async () => {

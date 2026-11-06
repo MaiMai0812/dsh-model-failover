@@ -32,6 +32,7 @@ import {
   DEFAULT_TEMPLATE_NAME,
   MAX_COOLDOWN_SEC,
   MAX_IDLE_TIMEOUT_SEC,
+  MAX_LIMIT_COOLDOWN_SEC,
   MAX_SAME_MODEL_RETRIES,
   MAX_TEMPLATE_CANDIDATES,
   MAX_TEMPLATE_NAME,
@@ -253,6 +254,12 @@ export function normalizeSettings(raw) {
       ? Math.min(source.cooldownSec, MAX_COOLDOWN_SEC)
       : DEFAULT_SETTINGS.cooldownSec
 
+  // 同上，0 = 用完不歇（并发上限本身照旧生效）。
+  const limitCooldownSec =
+    Number.isInteger(source.limitCooldownSec) && source.limitCooldownSec >= 0
+      ? Math.min(source.limitCooldownSec, MAX_LIMIT_COOLDOWN_SEC)
+      : DEFAULT_SETTINGS.limitCooldownSec
+
   return {
     enabled: source.enabled !== false,
     bootstrapped: source.bootstrapped === true,
@@ -275,6 +282,7 @@ export function normalizeSettings(raw) {
     continueDelaySec,
     idleTimeoutSec,
     cooldownSec,
+    limitCooldownSec,
     keepEventLog: source.keepEventLog !== false,
     eventLogLimit,
     // 会话页「隔离队列」显示谁：子智能体的会话默认不显示（那是委托出去的一次
@@ -384,7 +392,14 @@ export function apply(ctx, _config) {
    * 一起忘掉才是对的。建在这里的理由也同冷却：设置页 API 要读它（会话页那一栏
    * 要显示「用了几格」），`/reset` 也要能顺手清掉。
    */
-  const limits = new Concurrency({ now: () => Date.now() })
+  const limits = new Concurrency({
+    now: () => Date.now(),
+    // 读的时候才取，用户在设置页改那个数字不用重建这本账。
+    cooldownMs: () => {
+      const sec = settingsFile.get().limitCooldownSec
+      return (Number.isInteger(sec) && sec > 0 ? sec : 0) * 1000
+    },
+  })
 
   /** 把 `provider / model` 换成人看的名字；清单里查不到就原样回落。 */
   const labelOf = (provider, model) => {
@@ -710,6 +725,7 @@ export function apply(ctx, _config) {
     if ('continueDelaySec' in patch) next.continueDelaySec = patch.continueDelaySec
     if ('idleTimeoutSec' in patch) next.idleTimeoutSec = patch.idleTimeoutSec
     if ('cooldownSec' in patch) next.cooldownSec = patch.cooldownSec
+    if ('limitCooldownSec' in patch) next.limitCooldownSec = patch.limitCooldownSec
     if ('keepEventLog' in patch) next.keepEventLog = patch.keepEventLog !== false
     if ('eventLogLimit' in patch) next.eventLogLimit = patch.eventLogLimit
     if ('showSubagentSessions' in patch) next.showSubagentSessions = patch.showSubagentSessions === true

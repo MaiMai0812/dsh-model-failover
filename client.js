@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
     const MAX_IDLE_TIMEOUT_SEC = 3600
     /** 与 lib/constants.js 的 MAX_COOLDOWN_SEC 一致：再久就不该叫「冷却」了。 */
     const MAX_COOLDOWN_SEC = 3600
+    /** 与 lib/constants.js 的 MAX_LIMIT_COOLDOWN_SEC 一致：收工冷却只该是「等一下」。 */
+    const MAX_LIMIT_COOLDOWN_SEC = 300
 
     /**
      * 试连接同时发几条。
@@ -120,14 +122,19 @@ window.__ModuleLoader__.load({
 .mf-select { flex: 1; }
 .mf-effort { flex: none; max-width: 150px; }
 .mf-effort-none { flex: none; opacity: .45; font-size: 11.5px; }
-/* 并发上限输入框：比思考强度窄，挤在它左边。 */
-.mf-limit { flex: none; width: 58px; text-align: center; font-variant-numeric: tabular-nums; }
-.mf-limit::placeholder { opacity: .5; }
 /* 「用着几个/上限」小胶囊：占满了变红（那是它被跳过的原因）。 */
 .mf-cap { flex: none; border: 1px solid color-mix(in srgb, currentColor 28%, transparent); border-radius: 5px; padding: 0 4px; font-size: 11px; font-variant-numeric: tabular-nums; opacity: .8; }
 .mf-cap-full { border-color: #e5484d; color: #e5484d; opacity: 1; }
 .mf-input { flex: 1; }
 .mf-num { width: 72px; }
+/* 并发上限输入框：最多就两位数，所以窄到刚好放得下两位。
+   必须写在 .mf-input 后面 —— 两条都是单类名、同分，后到的赢；写在前面的话
+   「.mf-input { flex: 1 }」会把它重新撑满整行（这正是它原来那么宽的原因）。 */
+.mf-limit { flex: none; width: 44px; padding: 4px 2px; text-align: center; font-variant-numeric: tabular-nums; appearance: textfield; -moz-appearance: textfield; }
+.mf-limit::placeholder { opacity: .5; }
+/* 数字框那两个上下箭头要吃掉十几个像素，这里只有两位数的位置，去掉它们；
+   键盘的上下方向键照样能加减。 */
+.mf-limit::-webkit-outer-spin-button, .mf-limit::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
 .mf-opt { display: flex; align-items: center; gap: 10px; }
 .mf-opt > .mf-opt-main { flex: 1; min-width: 0; }
 .mf-switch { flex: none; width: 38px; height: 22px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 22%, transparent); background: color-mix(in srgb, currentColor 8%, transparent); position: relative; cursor: pointer; padding: 0; }
@@ -231,6 +238,8 @@ window.__ModuleLoader__.load({
         coolingHint: '上游在限流。它只是暂时忙，等一会儿就会自动回到队列里，不算今天的隔离。',
         coolingHeld: '限流已结束，等这一趟跑完',
         coolingHeldHint: '上游的等待时间已经到了，但现在这一趟是别的模型在替它干活。要等这一趟跑完或者报错，它才能回到队首。',
+        limitCooling: '收工歇 {n} 秒',
+        limitCoolingHint: '它设了并发上限，最后一个会话刚用完、正在歇，所以这一趟先跳过它。歇完自动回到队列；时长在设置页「并发模型收工后再歇」里改。',
         failCountHint: '今天这个模型一共失败了几次（所有会话合计）',
         goodCountHint: '今天这个模型成功了几次（所有会话合计）',
         queueHint:
@@ -275,6 +284,10 @@ window.__ModuleLoader__.load({
         optCooldownHint:
           '限流是「等一下就能用」，不是「今天不行」，所以它不进当日隔离名单：只让队列在这么多秒里跳过它，到点自动回来。上游在报错里说了具体时间（比如「再等 20 秒」）就以它为准，这个值只在它没说时兜底。0 = 不冷却，限流照旧隔离到明天。',
         optCooldownUnit: '秒',
+        optLimitCooldown: '并发模型收工后再歇',
+        optLimitCooldownHint:
+          '设了并发上限的模型，最后一个会话用完它之后先歇这么多秒再接下一个会话。上游那边的连接/配额通常比本地慢半拍 —— 本地一放手就立刻塞下一个请求进去，很容易撞出个跟模型质量毫无关系的 429。只影响填了并发上限的候选。0 = 不歇。',
+        optLimitCooldownUnit: '秒',
         optAllQuarantined: '全部被隔离时仍然按顺序试一遍',
         optAllQuarantinedHint: '关掉后队列里全是隔离模型时会直接报错，不再尝试。',
         optKeepLog: '记录事件日志',
@@ -420,6 +433,9 @@ window.__ModuleLoader__.load({
         coolingHeld: 'Rate limit over — waiting for this call to finish',
         coolingHeldHint:
           'The upstream wait is over, but another model is currently running the call in its place. It only gets the front of the queue back once that call finishes or fails.',
+        limitCooling: 'Resting {n}s',
+        limitCoolingHint:
+          'It has a concurrency limit and the last conversation just finished, so it is resting and this call skips it. It rejoins the queue on its own; the delay is under “Rest after a model finishes” in Settings.',
         failCountHint: 'How many times this model failed today (all conversations)',
         goodCountHint: 'How many times this model succeeded today (all conversations)',
         queueHint:
@@ -464,6 +480,10 @@ window.__ModuleLoader__.load({
         optCooldownHint:
           'A rate limit means "try again in a moment", not "broken for the day", so it never enters the daily quarantine list: the queue just steps around it for this many seconds and comes back on its own. If the upstream says when to retry (e.g. "retry after 20s"), that wins; this value is the fallback. 0 = no cooldown, rate limits go back to being quarantined until tomorrow.',
         optCooldownUnit: 'sec',
+        optLimitCooldown: 'Rest after a model finishes',
+        optLimitCooldownHint:
+          'For models with a concurrency limit: after the last conversation using it finishes, wait this long before letting the next one in. The upstream usually frees its connections/quota a moment after the local side lets go, and pushing the next request straight in tends to produce a 429 that has nothing to do with model quality. Only affects candidates with a concurrency limit. 0 = no rest.',
+        optLimitCooldownUnit: 'sec',
         optAllQuarantined: 'Still try the queue when all are quarantined',
         optAllQuarantinedHint: 'Turned off, an all-quarantined queue fails immediately.',
         optKeepLog: 'Keep an event log',
@@ -977,6 +997,24 @@ window.__ModuleLoader__.load({
         return set
       }, [state])
 
+      /**
+       * 刚收工、还在「并发收工冷却」里的候选：`key -> 还要歇多少毫秒`。
+       *
+       * 和上面的限流冷却长得像、来源完全不同：那个是上游把请求顶回来之后被动等，
+       * 这个是我们自己刚把最后一格并发还回去、故意让下一个会话晚几秒进来
+       * （设置页的「并发模型收工后再歇」，默认 5 秒）。同样是「排第一却没被用」，
+       * 所以队列行也得说清楚，否则用户只会觉得队列坏了。
+       */
+      const restingLeft = useMemo(() => {
+        const map = new Map()
+        for (const row of state?.limits ?? []) {
+          if (typeof row.key !== 'string') continue
+          const ms = Number.isFinite(row.coolingMs) ? row.coolingMs : 0
+          if (ms > 0) map.set(row.key, ms)
+        }
+        return map
+      }, [state])
+
       /** 已接入但还没进队列的模型，按 provider 分组给下拉框用。 */
       const available = useMemo(() => {
         const inQueue = new Set(order.map((item) => keyOf(item.provider, item.model)))
@@ -1311,17 +1349,18 @@ window.__ModuleLoader__.load({
       /**
        * 队列里第一个真正能用的模型 —— 也就是下一个任务会从谁起头。
        *
-       * 隔离的（今天不行）和冷却中的（限流，还要等几十秒）都要跳过：两者都会
-       * 被 `chain()` 滤掉，说「下一个从它开始」就是在骗人。
+       * 隔离的（今天不行）、限流冷却中的（还要等几十秒）和刚收工还在歇的
+       * （并发收工冷却）都要跳过：三者都会被 `chain()` 滤掉，说「下一个从它
+       * 开始」就是在骗人。
        */
       const startAt = useMemo(() => {
         if (order.length === 0) return undefined
         const usable = order.find((item) => {
           const key = keyOf(item.provider, item.model)
-          return !quarantinedKeys.has(key) && !coolingLeft.has(key)
+          return !quarantinedKeys.has(key) && !coolingLeft.has(key) && !restingLeft.has(key)
         })
         return usable ?? order[0]
-      }, [order, quarantinedKeys, coolingLeft])
+      }, [order, quarantinedKeys, coolingLeft, restingLeft])
 
       const labelOf = useCallback((provider, model) => {
         const hit = (state?.catalog ?? []).find((row) => row.provider === provider && row.model === model)
@@ -1617,6 +1656,17 @@ window.__ModuleLoader__.load({
                             'data-role': 'cooling',
                           }, coolingText(coolingLeft.get(key), coolingHeld.has(key)))
                         : null,
+                      // 刚收工、还在并发冷却里：跟限流冷却画同一种「忙」标签，
+                      // 但文案要说清楚是**我们**让它歇的，不是上游顶回来的。
+                      restingLeft.has(key)
+                        ? span({
+                            className: 'mf-probe mf-probe-busy',
+                            title: t('limitCoolingHint'),
+                            'data-role': 'limit-cooling',
+                          }, t('limitCooling', {
+                            n: Math.max(1, Math.ceil(restingLeft.get(key) / 1000)),
+                          }))
+                        : null,
                     ),
                     div({ className: 'mf-sub' }, `${hit?.providerName ?? item.provider} · ${item.model}`),
                   ),
@@ -1767,6 +1817,26 @@ window.__ModuleLoader__.load({
                 onCommit: (value) => { if (value !== settings.cooldownSec) void run('/settings', { cooldownSec: value }) },
               }),
               span({ className: 'mf-note' }, t('optCooldownUnit')),
+            ),
+            // 并发上限的收工冷却：只跟在「填了并发上限」的候选后面，所以紧挨着
+            // 限流冷却那一行 —— 两者都是「先绕开它一会儿」，但一个是被上游限流，
+            // 一个是自己刚收工。
+            div({ className: 'mf-opt' },
+              div({ className: 'mf-opt-main' },
+                div(null, t('optLimitCooldown')),
+                div({ className: 'mf-note' }, t('optLimitCooldownHint')),
+              ),
+              h(NumberInput, {
+                value: settings.limitCooldownSec ?? 5,
+                min: 0,
+                max: MAX_LIMIT_COOLDOWN_SEC,
+                name: 'limitCooldownSec',
+                disabled: busy || settings.enabled === false,
+                onCommit: (value) => {
+                  if (value !== settings.limitCooldownSec) void run('/settings', { limitCooldownSec: value })
+                },
+              }),
+              span({ className: 'mf-note' }, t('optLimitCooldownUnit')),
             ),
             h(ToggleRow, {
               label: t('optAllQuarantined'),

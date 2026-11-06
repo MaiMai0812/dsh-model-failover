@@ -220,7 +220,7 @@ function createLlm(scripts) {
  * @param {number} [spec.at] - 初始「现在」。
  * @param {object} [spec.cacheFile] - 扫描缓存落盘用的 JsonFile（验跨启动延续时才给）。
  */
-async function harness({ order, scripts, settings: overrides = {}, at = new Date(2026, 1, 14, 6, 0, 0).getTime(), cacheFile }) {
+async function harness({ order, scripts, settings: overrides = {}, at = new Date(2026, 1, 14, 6, 0, 0).getTime(), cacheFile, sleepAdvancesClock = false }) {
   const llm = createLlm(scripts)
   llm.register('alpha', [{ id: 'one', name: 'Alpha One' }, { id: 'two', name: 'Alpha Two' }])
   llm.register('beta', [{ id: 'one', name: 'Beta One' }, { id: 'two', name: 'Beta Two' }])
@@ -257,7 +257,15 @@ async function harness({ order, scripts, settings: overrides = {}, at = new Date
   // 冷却表跟着假时钟走 —— 用例要靠 `clock.ms` 快进，验证「到点自动回来」。
   const cooldowns = new Cooldowns({ now: () => clock.ms })
   // 并发占用表：和冷却一样在这个假 harness 里自己建一份，用例要直接查它。
-  const limits = new Concurrency({ now: () => clock.ms })
+  //
+  // 「收工冷却」默认 0（不歇）：既有用例里「别人一放手就立刻接着用」的期望
+  // 不能被新加的节流悄悄改掉 —— 默认值是产品行为，这是**测试基座**的行为，
+  // 要验冷却的用例自己传 `limitCooldownSec`。
+  const limitCooldownSec = Number.isFinite(overrides.limitCooldownSec) ? overrides.limitCooldownSec : 0
+  const limits = new Concurrency({
+    now: () => clock.ms,
+    cooldownMs: () => limitCooldownSec * 1000,
+  })
   const adapter = new FailoverAdapter({
     llm,
     settings,
@@ -268,7 +276,12 @@ async function harness({ order, scripts, settings: overrides = {}, at = new Date
     limits,
     log: { warn: () => {}, push: (event) => events.push(event) },
     now: () => clock.ms,
-    sleep: async (ms) => { waits.push(ms) },
+    sleep: async (ms) => {
+      waits.push(ms)
+      // 「等一会儿再复查」的用例需要时间真的走：默认不走，免得既有的计时断言
+      // 被这 5 秒悄悄带偏。
+      if (sleepAdvancesClock === true) clock.ms += ms
+    },
   })
 
   return { llm, clock, settings, health, catalog, adapter, notes, events, waits, cooldowns, limits }
@@ -1689,6 +1702,92 @@ await check('并发上限：全队都被占满时不硬闯，也不隔离任何�
   assert.equal(textOf(again), 'alpha 说话')
 })
 
+await check('并发收工冷却：最后一格还回去才开始歇，跟着时钟走，到点自己恢复', async () => {
+  const key = routeKey('alpha', 'one')
+  let now = 1_000
+  const table = new Concurrency({ now: () => now, cooldownMs: () => 5_000 })
+  table.acquire(key, 2, 's1')
+  table.acquire(key, 2, 's2')
+  table.release(key, 2, 's1')
+  assert.equal(table.coolingMs(key), 0, '还有人占着就不算收工，不该开始歇')
+  assert.equal(table.usable(key, 2, 's3'), true, '还空着一格，别人本来就能进')
+  table.release(key, 2, 's2')
+  assert.equal(table.coolingMs(key), 5_000, '最后一格还回去 → 歇 5 秒')
+  assert.equal(table.usable(key, 2, 's3'), false, '歇着的时候新会话进不来')
+  const rows = table.view(new Map([[key, { cap: 2, provider: 'alpha', model: 'one' }]]))
+  assert.equal(rows[0]?.coolingMs, 5_000, '视图要带上剩余冷却，设置页/队列才有得显示')
+  now += 1_000
+  assert.equal(table.coolingMs(key), 4_000, '跟着时钟往前走')
+  now += 4_000
+  assert.equal(table.coolingMs(key), 0, '到点就清掉，不留垃圾')
+  assert.equal(table.usable(key, 2, 's3'), true)
+  // 设置里填 0 就是不歇 —— 老行为，一个字节都不该变慢。
+  const quick = new Concurrency({ now: () => now, cooldownMs: () => 0 })
+  quick.acquire(key, 1, 's1')
+  quick.release(key, 1, 's1')
+  assert.equal(quick.coolingMs(key), 0)
+  assert.equal(quick.usable(key, 1, 's2'), true)
+})
+
+await check('并发收工冷却：刚收工的候选先让给后面的，歇完自己回到队首', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')], [betaKey, ok('beta 说话')]]),
+    settings: { limitCooldownSec: 5 },
+  })
+  // 别的会话刚用完 alpha：最后一格还回去，进入收工冷却。
+  h.limits.acquire(alphaKey, 1, 'other')
+  h.limits.release(alphaKey, 1, 'other')
+
+  const first = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [betaKey], 'alpha 还在歇，这一趟该直接用后面的 beta')
+  assert.equal(textOf(first), 'beta 说话')
+  assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0, '「在歇」不是故障，不许隔离')
+
+  // 歇够了，队首还是它。
+  h.clock.ms += 5_000
+  const second = await drain(runS1(h, 's2'))
+  assert.deepEqual(commands(h.llm), [betaKey, alphaKey], '冷却到点就该用回 alpha')
+  assert.equal(textOf(second), 'alpha 说话')
+})
+
+await check('并发收工冷却：后面没人可用时先等这一小会儿，不误报「没模型」', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')]]),
+    settings: { limitCooldownSec: 5 },
+    sleepAdvancesClock: true,
+  })
+  h.limits.acquire(alphaKey, 1, 'other')
+  h.limits.release(alphaKey, 1, 'other')
+
+  const chunks = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey], '整条队列只有它，等完这 5 秒照样得用它')
+  assert.equal(h.waits.at(-1), 5_000, `等的是冷却剩下的那点时间：${JSON.stringify(h.waits)}`)
+  assert.equal(finishOf(chunks)?.reason?.kind, 'stop', '不该因为节流就报错')
+  assert.equal(textOf(chunks), 'alpha 说话')
+})
+
+await check('并发收工冷却：设置成 0 就完全不歇', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')]]),
+    settings: { limitCooldownSec: 0 },
+  })
+  h.limits.acquire(alphaKey, 1, 'other')
+  h.limits.release(alphaKey, 1, 'other')
+  assert.equal(h.limits.coolingMs(alphaKey), 0, '0 秒 = 立刻可以再用')
+
+  const chunks = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey])
+  assert.deepEqual(h.waits, [], '连一次等待都不该有')
+  assert.equal(textOf(chunks), 'alpha 说话')
+})
+
 await check('红绿计数：失败一次记一次、成功一次记一次，跨会话合计', async () => {
   const alphaKey = routeKey('alpha', 'one')
   const scripts = new Map([[alphaKey, quota('额度没了')]])
@@ -1916,6 +2015,22 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     const clamped = await call('POST', '/api/dsh-model-failover/settings', { resetHour: 99, eventLogLimit: 0 })
     assert.equal(clamped.json.settings.resetHour, 1, '非法的重置时间应回落到默认值')
     assert.equal(clamped.json.settings.eventLogLimit, DEFAULT_SETTINGS.eventLogLimit)
+
+    // 并发上限的收工冷却：设一次能存进去、能读回来，越界/非法要收敛。
+    assert.equal(state.json.settings.limitCooldownSec, 5, '默认 5 秒')
+    const cooled = await call('POST', '/api/dsh-model-failover/settings', { limitCooldownSec: 12 })
+    assert.equal(cooled.json.settings.limitCooldownSec, 12, '设置页填的数字要真的落到设置里')
+    const reread = await call('GET', '/api/dsh-model-failover/state')
+    assert.equal(reread.json.settings.limitCooldownSec, 12, '再读一次还是它（不是只回显）')
+    const tooLong = await call('POST', '/api/dsh-model-failover/settings', { limitCooldownSec: 9_999 })
+    assert.equal(tooLong.json.settings.limitCooldownSec, 300, '再久就不叫「等一下」了，收到 300 秒')
+    // 0 是合法值：不歇（老行为），不能被当成「没填」而回落到 5。
+    const off = await call('POST', '/api/dsh-model-failover/settings', { limitCooldownSec: 0 })
+    assert.equal(off.json.settings.limitCooldownSec, 0, '0 = 不歇，要原样保留')
+    const negative = await call('POST', '/api/dsh-model-failover/settings', { limitCooldownSec: -3 })
+    assert.equal(negative.json.settings.limitCooldownSec, 5, '负数回落到默认值')
+    // 后面几条用例都按「默认 5 秒」走，收尾改回来。
+    await call('POST', '/api/dsh-model-failover/settings', { limitCooldownSec: 5 })
 
     // 隔离名单 + 解除
     const quarantined = await call('POST', '/api/dsh-model-failover/reset', {})
