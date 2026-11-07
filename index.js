@@ -944,6 +944,39 @@ export function apply(ctx, _config) {
     logger.info?.('model-failover: 已接管「本轮失败 / 输出撞上限」时的自动「继续」')
   })
 
+  // ── 会话关掉了：把它占着的并发名额还回去 ────────────────────────────────
+  //
+  // 并发名额是**会话级租约**（见 lib/limits.js 的文件头）：一个会话一旦抢到某
+  // 个设了上限的模型的名额，就钉在那儿一直到「这个模型报错」或「会话结束」。
+  // 前半句归适配器管，后半句归这里 —— 会话窗一关，它再也不会回来用它，不还
+  // 就等于把那一格永久漏掉了；别人只看到「上限明明有空位，怎么一直轮不到」。
+  //
+  // 为什么不写在 `autoContinue.attach()` 里：那是「自动继续」的本职，和并发账
+  // 无关；而且上面那个 inject 只在有 `agents` 的组合里跑，headless/TUI 里没有
+  // 它 —— 但 `session/disposed` 是 cordis 的事件，不需要任何服务就能订阅。
+  //
+  // 写法和 api-session-controller 一致（`ctx.on('session/disposed', (session) => …)`，
+  // 见 app.asar 里 dsh-api-session-controller 的订阅），回调参数就是会话本身。
+  try {
+    ctx.effect(() => {
+      const off = ctx.on?.('session/disposed', (session) => {
+        const sessionId = typeof session?.id === 'string' ? session.id : undefined
+        if (sessionId === undefined) return
+        const freed = limits.freeSession(sessionId)
+        if (freed > 0) logger.info?.(`model-failover: 会话结束，已交还它占着的 ${freed} 个并发名额`)
+      })
+      return () => {
+        try {
+          off?.()
+        } catch {
+          /* 已经随 fiber 一起卸了 */
+        }
+      }
+    }, 'model-failover: release concurrency lease on session/disposed')
+  } catch (error) {
+    logger.warn?.(`model-failover: 订阅 session/disposed 失败（会话结束时可能晚一点才释放并发名额）— ${String(error?.message ?? error)}`)
+  }
+
   // ── 收摊 ────────────────────────────────────────────────────────────────
   ctx.effect(
     () => () => {
