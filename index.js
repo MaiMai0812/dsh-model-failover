@@ -425,14 +425,24 @@ export function apply(ctx, _config) {
     return caps
   }
 
-  /** 这些上限此刻占了几格。跨模板按候选去重，一个候选最多出现一次。 */
-  const limitsView = (templateId) => {
+  /**
+   * 这些上限此刻占了几格。跨模板按候选去重，一个候选最多出现一次。
+   *
+   * `onlyKey` 是给会话页用的：那一栏要说的是「我这个会话现在用的这个模型，还有
+   * 没有名额」，不是「这台机器上有哪些模型设了上限」。一条队列动辄十几个模型，
+   * 全都铺在对应用户正在看的那个会话框里，只会把真正要看的那一行淹掉。
+   */
+  const limitsView = (templateId, onlyKey) => {
     let caps = capsFor(templateId)
     if (templateId === undefined) {
       caps = new Map()
       for (const template of settingsFile.get().templates) {
         for (const [key, meta] of capsFor(template.id)) if (!caps.has(key)) caps.set(key, meta)
       }
+    }
+    if (typeof onlyKey === 'string') {
+      const one = caps.get(onlyKey)
+      caps = one === undefined ? new Map() : new Map([[onlyKey, one]])
     }
     return limits.view(caps).map((row) => ({ ...row, label: labelOf(row.provider, row.model) }))
   }
@@ -637,12 +647,22 @@ export function apply(ctx, _config) {
         templateName: hit.templateId === undefined ? '' : templateName(hit.templateId),
       }
     }
-    // 并发占用：挂在这个会话自己的模板上。取模板的优先级与上面显示「模板」那一栏
-    // 一致 —— 正在跑的 > 上一趟跑的 > 默认模板。会话还没跑过任何一趟时它照样
-    // 列出上限（占用量当然是 0），用户设完就能看见。
+    // 并发占用：**只说这个会话此刻正在用的那个模型**，不把整条队列里所有设了
+    // 上限的候选铺出来。那一栏回答的是「我现在用的这个还有没有名额」，一条队列
+    // 十几个模型全列出来会把它该说的一句话淹掉。
+    //
+    // 「此刻正在用」与上面「正在用」那一行的口径一致：正在跑的优先，没有就是上
+    // 一趟跑过的。两者都没有（会话还没跑过任何一趟）就没什么「当前模型」可报，
+    // 这一栏整行不画 —— 这跟「候选都没设上限」在界面上是同一个结果，也确实没
+    // 有信息可给。
     for (const row of table.values()) {
-      const templateId = row.running?.templateId ?? row.active?.templateId ?? DEFAULT_TEMPLATE_ID
-      row.capped = limitsView(templateId)
+      const current = row.running ?? row.active
+      if (current === undefined) {
+        row.capped = []
+        continue
+      }
+      const templateId = current.templateId ?? DEFAULT_TEMPLATE_ID
+      row.capped = limitsView(templateId, routeKey(current.provider, current.model))
     }
     // 有事的会话排前面：隔离着的 → 正在跑的 → 其余。
     return [...table.values()].sort((left, right) => {
@@ -896,6 +916,46 @@ export function apply(ctx, _config) {
         logFile.replace({ events: [] })
         logFile.flush()
         sendJson(res, 200, snapshot(now))
+        return
+      }
+
+      if (method === 'POST' && path === '/forget-record') {
+        // 会话页上每颗胶囊左边那颗叉叉：只删这一条，别的什么都不动。
+        //
+        // 和 `/reset?sessionId=` 的区别只有颗粒度：那个是「这个会话今天撞的墙全
+        // 不算了」，这个是「就这一条，我看着不对」。所以它**不**碰限流冷却表和
+        // 并发账本 —— 用户删的是一条日期名单上的记录，不是要求立刻重跑。
+        const body = await readJsonBody(req)
+        const target = {
+          sessionId: typeof body?.sessionId === 'string' ? body.sessionId : sessionId,
+          templateId: typeof body?.templateId === 'string' ? body.templateId : undefined,
+          key: typeof body?.key === 'string' ? body.key : '',
+          kind: body?.kind === 'good' ? 'good' : 'quarantine',
+        }
+        if (target.key === '') {
+          sendJson(res, 400, { ok: false, error: '要删哪一条？缺少 key' })
+          return
+        }
+        const settings = settingsFile.get()
+        const removed = health.clearRecord(now, settings.resetHour, target)
+        stateFile.flush()
+        if (removed) {
+          pushEvent({
+            at: now,
+            kind: 'forget-record',
+            key: target.key,
+            record: target.kind,
+            provider: splitKey(target.key).provider,
+            model: splitKey(target.key).model,
+            sessionId: target.sessionId,
+            templateId: target.templateId,
+          })
+        }
+        sendJson(res, 200, {
+          ok: true,
+          removed,
+          sessions: sessionRows(now),
+        })
         return
       }
 

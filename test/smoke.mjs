@@ -2267,6 +2267,124 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(again.status, 200)
     assert.equal(again.json.cleared, 0, '没有隔离可解时返回 0')
 
+    // ── 只划掉一条记录（会话页每颗胶囊左边那颗叉叉） ────────────────────────
+    // 此刻 sess-other 还挂着 beta/one，sess-queue 是干净的。先用 sess-other
+    // 身上那条真的记录验「删掉」，而不是拿一条虚构的 key 空转。
+    const missingKey = await call('POST', '/api/dsh-model-failover/forget-record', {})
+    assert.equal(missingKey.status, 400, '没说删哪一条就必须拒绝')
+    assert.equal(missingKey.json.ok, false)
+    assert.match(missingKey.json.error, /key/)
+
+    // 删一条根本不在名单上的：不报错，也不许假装删掉了。
+    const ghost = await call('POST', '/api/dsh-model-failover/forget-record', {
+      sessionId: 'sess-other', templateId: 'default', key: routeKey('alpha', 'one'), kind: 'quarantine',
+    })
+    assert.equal(ghost.status, 200)
+    assert.equal(ghost.json.removed, false, '没有这条记录就该如实说没删')
+    const stillThere = ghost.json.sessions.find((row) => row.sessionId === 'sess-other')
+    assert.equal(stillThere.quarantined.length, 1, '没删成也不能顺手带走别的')
+
+    // 真的删：只该少那一条，别的会话、别的模型一律不动。
+    const dropped = await call('POST', '/api/dsh-model-failover/forget-record', {
+      sessionId: 'sess-other', templateId: 'default', key: routeKey('beta', 'one'), kind: 'quarantine',
+    })
+    assert.equal(dropped.status, 200)
+    assert.equal(dropped.json.removed, true, '这一条应当真的删掉了')
+    const cleaned = dropped.json.sessions.find((row) => row.sessionId === 'sess-other')
+    assert.equal(cleaned.quarantined.length, 0, '删完之后这个会话名下不该还有隔离')
+    // 再删一次：同一个请求不能删出第二份效果。
+    const twice = await call('POST', '/api/dsh-model-failover/forget-record', {
+      sessionId: 'sess-other', templateId: 'default', key: routeKey('beta', 'one'), kind: 'quarantine',
+    })
+    assert.equal(twice.json.removed, false, '已经删掉了，第二次应当说没删')
+
+    // 「已隔离」和「已验证」是两份独立名单：删其中一份不许牵连另一份。
+    for await (const _ of registrations[0].adapter.stream({
+      provider: ROUTE,
+      model: 'auto',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '再跑一次' }] }],
+      sessionId: 'sess-record',
+    })) { /* 把流跑完 */ }
+    const beforeRecord = await call('GET', '/api/dsh-model-failover/sessions')
+    const recorded = beforeRecord.json.sessions.find((row) => row.sessionId === 'sess-record')
+    assert.ok(recorded.quarantined.length > 0, `这一步要先有隔离可删：${JSON.stringify(recorded)}`)
+    assert.ok(recorded.good.length > 0, `这一步也要有「已验证」：${JSON.stringify(recorded)}`)
+    const goodKey = recorded.good[0].key
+    const keepQuarantine = await call('POST', '/api/dsh-model-failover/forget-record', {
+      sessionId: 'sess-record', templateId: recorded.good[0].templateId, key: goodKey, kind: 'good',
+    })
+    assert.equal(keepQuarantine.json.removed, true, '删「已验证」那一条')
+    const afterRecord = keepQuarantine.json.sessions.find((row) => row.sessionId === 'sess-record')
+    assert.equal(afterRecord.good.length, 0, '「已验证」这一条没了')
+    assert.equal(afterRecord.quarantined.length, recorded.quarantined.length, '隔离那几条一条都不许被顺手删掉')
+
+    // ── 并发限制一栏只说「当前这个模型」 ────────────────────────────────────
+    // 两个候选都设了上限，但会话此刻只可能跑在其中一个上：那一栏必须只报它。
+    const capped = await call('POST', '/api/dsh-model-failover/settings', {
+      templates: [{
+        id: 'default',
+        name: '默认模板',
+        order: [
+          { provider: 'alpha', model: 'one', concurrency: 2 },
+          { provider: 'beta', model: 'one', concurrency: 1 },
+        ],
+      }],
+    })
+    assert.equal(capped.status, 200)
+    for await (const _ of registrations[0].adapter.stream({
+      provider: ROUTE,
+      model: 'auto',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '跑一下' }] }],
+      sessionId: 'sess-capped',
+    })) { /* 把流跑完 */ }
+    const cappedView = await call('GET', '/api/dsh-model-failover/sessions')
+    const cappedRow = cappedView.json.sessions.find((row) => row.sessionId === 'sess-capped')
+    assert.ok(cappedRow !== undefined, '跑过之后应出现这个会话')
+    assert.equal(cappedRow.capped.length, 1, `并发一栏只报当前模型，实际：${JSON.stringify(cappedRow.capped)}`)
+    assert.equal(cappedRow.capped[0].key, routeKey('alpha', 'one'), '报的就是它此刻在用的那个')
+    assert.equal(cappedRow.capped[0].cap, 2, '上限原样带出来')
+    // 换成 beta 在前、且 beta 能跑通：另一个会话（新会话，没有钉住的租约）从头
+    // 开始就会落在 beta 上，那一栏要跟着它换人，而不是一直报队首之外的 alpha。
+    scripts.set(routeKey('beta', 'one'), ok('换我跑'))
+    await call('POST', '/api/dsh-model-failover/settings', {
+      templates: [{
+        id: 'default',
+        name: '默认模板',
+        order: [
+          { provider: 'beta', model: 'one', concurrency: 1 },
+          { provider: 'alpha', model: 'one', concurrency: 2 },
+        ],
+      }],
+    })
+    for await (const _ of registrations[0].adapter.stream({
+      provider: ROUTE,
+      model: 'auto',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '换个模型' }] }],
+      sessionId: 'sess-capped-b',
+    })) { /* 把流跑完 */ }
+    const movedView = await call('GET', '/api/dsh-model-failover/sessions')
+    const movedRow = movedView.json.sessions.find((row) => row.sessionId === 'sess-capped-b')
+    assert.equal(movedRow.capped.length, 1, '换人之后仍然只报一条')
+    assert.equal(movedRow.capped[0].key, routeKey('beta', 'one'), '跟着当前模型走，不是报固定的第一条')
+    // 原来那个会话仍然钉在 alpha 上（租约语义）：它那一栏也该照样报 alpha。
+    const stayedRow = movedView.json.sessions.find((row) => row.sessionId === 'sess-capped')
+    assert.equal(stayedRow.capped.length, 1, '老会话那一栏也只报一条')
+    assert.equal(stayedRow.capped[0].key, routeKey('alpha', 'one'), '它没换人，就不该跟着别人换')
+    // 设置页那份快照仍然是全量：它回答的是「这台机器上有哪些模型设了上限」。
+    const fullView = await call('GET', '/api/dsh-model-failover/state')
+    assert.equal(fullView.json.limits.length, 2, '设置页要看全部设了上限的模型，这条不能跟着收窄')
+
+    // 收摊：把队列、脚本都还原成这一段之前的样子，免得后面「beta 探不通」那几条
+    // 被这里临时塞进去的脚本喂成另一个结论。
+    scripts.delete(routeKey('beta', 'one'))
+    await call('POST', '/api/dsh-model-failover/settings', {
+      templates: [{
+        id: 'default',
+        name: '默认模板',
+        order: [{ provider: 'beta', model: 'one' }, { provider: 'alpha', model: 'one' }],
+      }],
+    })
+
     const unknown = await call('GET', '/api/dsh-model-failover/nope')
     assert.equal(unknown.status, 404)
 

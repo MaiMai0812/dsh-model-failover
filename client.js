@@ -168,6 +168,12 @@ window.__ModuleLoader__.load({
 .mf-qv-item > .mf-qv-code { opacity: .65; }
 /* 右键就能整块复制，鼠标形状得先说明这件事。 */
 .mf-qv-item.mf-copyable { cursor: context-menu; }
+/* 胶囊左边那颗叉叉：把这一条记录从名单上单独划掉。
+   它比胶囊本身更淡（不是主操作），但比纯图标好按 —— 这里的每一颗都贴着别的
+   可点区域，太小的热区只会让人点到旁边的胶囊上。 */
+.mf-qv-x { flex: none; font: inherit; font-size: 11px; line-height: 1; color: inherit; opacity: .45; background: transparent; border: 0; border-radius: 4px; padding: 1px 3px; margin: 0 -3px 0 -2px; cursor: pointer; }
+.mf-qv-x:hover:not(:disabled) { opacity: 1; background: color-mix(in srgb, currentColor 16%, transparent); }
+.mf-qv-x:disabled { opacity: .2; cursor: default; }
 .mf-copied { margin-left: 4px; color: #30a46c; }
 /* 输出速度：蓝框蓝字，紧跟在模型名后面。跟红/绿胶囊并排，一眼分清「今天行不行」
    和「用起来多快」是两个问题。 */
@@ -347,6 +353,9 @@ window.__ModuleLoader__.load({
         evReset: '手动解除隔离，清了 {count} 个',
         evResetSession: '会话 {session} 手动解除隔离，清了 {count} 个',
         evForget: '重置了今天的运行状态',
+        evForgetRecord: '{provider}/{model} 的一条{record}记录被单独划掉',
+        evForgetRecordQuarantine: '隔离',
+        evForgetRecordGood: '已验证',
         tailModel: '本轮：{label}',
         viewQuarantine: '隔离队列',
         qvHint:
@@ -356,6 +365,11 @@ window.__ModuleLoader__.load({
         qvClearHint: '只解除这个会话的隔离，别的会话一条都不动。',
         qvCopied: '已复制',
         qvCopyFailed: '复制失败：浏览器没让我们写剪贴板，手动选中复制吧',
+        qvForget: '✕',
+        qvForgetHint: '把这一条记录划掉',
+        qvForgetQuarantineHint: '把这个模型今天的隔离撤掉，只撤这一条 —— 下一次它就能重新进队。别的模型、别的会话一条都不动。',
+        qvForgetGoodHint: '把这个模型从「已验证」名单上划掉，只划这一条 —— 它仍然可用，只是不再预先把这一趟算作靠谱。别的记录一条都不动。',
+        qvForgetFailed: '没删掉：{message}',
         qvLoading: '读取中…',
         qvFailed: '读取失败：{message}',
         qvEmpty: '还没有任何会话跑过。',
@@ -543,6 +557,9 @@ window.__ModuleLoader__.load({
         evReset: 'Quarantine cleared by hand — {count} released',
         evResetSession: 'Quarantine cleared by hand in conversation {session} — {count} released',
         evForget: 'Today’s runtime state was reset',
+        evForgetRecord: 'One {record} record dropped for {provider}/{model}',
+        evForgetRecordQuarantine: 'quarantine',
+        evForgetRecordGood: 'verified',
         tailModel: 'Turn: {label}',
         viewQuarantine: 'Quarantine',
         qvHint:
@@ -552,6 +569,11 @@ window.__ModuleLoader__.load({
         qvClearHint: 'Only clears the quarantine of this conversation; other conversations are untouched.',
         qvCopied: 'Copied',
         qvCopyFailed: 'Copy failed: the browser would not let us write to the clipboard — select the text instead',
+        qvForget: '✕',
+        qvForgetHint: 'Drop this record',
+        qvForgetQuarantineHint: 'Lift this model’s quarantine — this entry only. It becomes eligible again on the next run; no other model or conversation is touched.',
+        qvForgetGoodHint: 'Drop this model from “Verified” — this entry only. It stays usable; it just stops counting as a safe bet up front.',
+        qvForgetFailed: 'Not removed: {message}',
         qvLoading: 'Loading…',
         qvFailed: 'Could not load: {message}',
         qvEmpty: 'No conversation has run anything yet.',
@@ -1400,6 +1422,15 @@ window.__ModuleLoader__.load({
             break
           case 'forget':
             body = t('evForget')
+            break
+          case 'forget-record':
+            // 单独划掉一条：会话页上那颗叉叉。把「隔离」还是「已验证」说清楚，
+            // 否则两条记录同一个模型名，事后分不出删的是哪一条。
+            body = t('evForgetRecord', {
+              provider: event.provider,
+              model: event.model,
+              record: t(event.record === 'good' ? 'evForgetRecordGood' : 'evForgetRecordQuarantine'),
+            })
             break
           case 'auto-continue':
             body = t('evAutoContinue', { trigger: t(event.trigger === 'max-tokens' ? 'trigMaxTokens' : 'trigError') })
@@ -2324,10 +2355,10 @@ window.__ModuleLoader__.load({
      * 拿不到时退回会话号前缀 —— 这一栏是给人看「哪个会话出事了」，标题只是
      * 帮助识别，缺了也不能空白。
      */
-    function SessionQueueRow({ row, mine, title, t, templateName, onClear, busy, onCopyError, copiedKey, nowMs }) {
+    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, busy, onCopyError, copiedKey, nowMs }) {
       const quarantined = row?.quarantined ?? []
       const good = row?.good ?? []
-      /** 这个会话的模板里，设了并发上限的那些候选（占用是宿主内存里的实时账）。 */
+      /** 这个会话**此刻在用的那个模型**的并发占用（宿主只报这一条，见 index.js）。 */
       const capped = row?.capped ?? []
       const active = row?.active
       const activeTemplate = typeof active?.templateName === 'string' && active.templateName !== ''
@@ -2382,6 +2413,32 @@ window.__ModuleLoader__.load({
             : t('qvTimeHint', { text: formatDuration(ms) }),
         }, formatDuration(ms))
       }
+      /**
+       * 一条记录左边那颗叉叉：把这一条从名单上单独划掉。
+       *
+       * 为什么要有它：那个「解除隔离」按钮是**整会话**范围的，而用户看着名单心疼
+       * 的时候往往只想清掉其中一条（一个早就好了的模型还挂着早上那条额度报错）。
+       * 划掉一条却说「全清了」，等于让人拿大锤敲钉子。
+       *
+       * 「已隔离」和「已验证」用的是同一个动作、两个 `kind`，因为它们其实是两份
+       * 独立的名单（`health.js` 里 `quarantine` 与 `good` 两个字段），删一份不该
+       * 顺手带走另一份。
+       */
+      const forgetButton = (item, kind) => h('button', {
+        type: 'button',
+        className: 'mf-qv-x',
+        disabled: busy === true,
+        title: kind === 'good' ? t('qvForgetGoodHint') : t('qvForgetQuarantineHint'),
+        // 露出来的字只有一个 ✕，读屏软件念出来是「乘号」—— 给它一句人话。
+        'aria-label': t('qvForgetHint'),
+        onClick: (event) => {
+          // 叉叉长在可右键复制的胶囊里：不拦一下，点它会把右键处理链也带起来。
+          event?.preventDefault?.()
+          event?.stopPropagation?.()
+          onForget?.(item, kind)
+        },
+      }, t('qvForget'))
+
       return div({ className: mine ? 'mf-qv-session mf-mine' : 'mf-qv-session' },
         div({ className: 'mf-qv-top' },
           span({ className: 'mf-qv-title' }, title === undefined || title === '' ? t('qvUnnamed') : title),
@@ -2433,6 +2490,7 @@ window.__ModuleLoader__.load({
                       onCopyError?.(item, chipKey)
                     },
                   },
+                    forgetButton(item, 'quarantine'),
                     span(null, sessionItemLabel(item)),
                     // 别的模板撞的墙不算这个会话当前的麻烦，但也不能凭空消失：
                     // 补一句模板名，说明它是哪条队列上的账。
@@ -2455,12 +2513,13 @@ window.__ModuleLoader__.load({
                 ...good.map((item) => h('span', {
                   className: 'mf-qv-item mf-ok',
                   key: `${item.key ?? ''}\u0000${item.templateId ?? ''}`,
-                }, sessionItemLabel(item), speedChip(item), timeChip(item))),
+                }, forgetButton(item, 'good'), sessionItemLabel(item), speedChip(item), timeChip(item))),
               ),
             ),
-        // 「并发限制」：这一栏只列**设了上限**的候选。它是用户自己配的一个小范围
-        // 事实（「这个上游同时收得下几个」），跟隔离、验证不在一条轴上，所以单开
-        // 一行 —— 没有任何上限时整行不画，不给空名单占地方。
+        // 「并发限制」：只画**这个会话当前用的那个模型**，宿主只报这一条（见
+        // index.js 的 sessionRows）。早先这里会把整条队列里所有设了上限的候选都
+        // 铺出来 —— 一条队列十几个模型，真正要看的那一行反倒被淹掉了。它跟隔离、
+        // 验证不在一条轴上，所以单开一行；没有上限就整行不画，不给空名单占地方。
         capped.length === 0
           ? null
           : div({ className: 'mf-qv-line' },
@@ -2504,6 +2563,14 @@ window.__ModuleLoader__.load({
       const mineId = props.sessionId
       const [data, setData] = useState(null)
       const [error, setError] = useState('')
+      /**
+       * 写操作失败的话，原样显示宿主那句错。
+       *
+       * 单独一格而不是塞进 `error`：`error` 在渲染时会被套上「读取失败：」，而
+       * 划掉一条记录失败根本不是在读取 —— 混在一起会说反话（明明写失败，界面
+       * 却说读失败）。
+       */
+      const [actionError, setActionError] = useState('')
       const [busy, setBusy] = useState(false)
       /** 刚复制过的那条隔离记录的 key —— 只为了在那颗胶囊上闪一下「已复制」。 */
       const [copied, setCopied] = useState('')
@@ -2654,6 +2721,41 @@ window.__ModuleLoader__.load({
       }, [busy, load, scoped])
 
       /**
+       * 划掉**一条**记录：某个会话、某条模板里，某个模型的「已隔离」或「已验证」。
+       *
+       * 跟上面 `clearOne()` 的区别只有颗粒度：那个是「这个会话今天撞的墙全不算
+       * 了」，这个是「就这一条，我看着不对」。所以它单独走一个路由，宿主那边也
+       * 只动那一格（见 `lib/health.js` 的 `clearRecord()`）。
+       *
+       * `busy` 一律上来就置位：这些叉叉都长在同一个会话卡片里，连点两下的时候
+       * 第二下要么落到已经删掉的条目上（白跑一趟），要么和第一下抢同一份
+       * `state.json` —— 禁掉比事后兜底简单。
+       */
+      const forgetOne = useCallback(async (item, kind, sessionId) => {
+        if (busy) return
+        const key = typeof item?.key === 'string' ? item.key : ''
+        if (key === '') return
+        setBusy(true)
+        try {
+          const next = await post('/forget-record', {
+            sessionId,
+            templateId: item?.templateId,
+            key,
+            kind,
+          })
+          if (!alive.current) return
+          if (Array.isArray(next?.sessions)) setData((previous) => ({ ...(previous ?? {}), ...next }))
+          setActionError('')
+          void load(false)
+        } catch (failure) {
+          if (!alive.current) return
+          setActionError(t('qvForgetFailed', { message: String(failure?.message ?? failure) }))
+        } finally {
+          if (alive.current) setBusy(false)
+        }
+      }, [busy, load, t])
+
+      /**
        * 右键一条隔离记录：把它的报错整块塞进剪贴板。
        *
        * 复制失败时**写进 error 那一行**，不假装成功 —— 这颗胶囊闪一下「已复制」
@@ -2687,6 +2789,7 @@ window.__ModuleLoader__.load({
         ),
         div({ className: 'mf-note' }, t('qvHint')),
         error !== '' ? div({ className: 'mf-err' }, t('qvFailed', { message: error })) : null,
+        actionError !== '' ? div({ className: 'mf-err' }, actionError) : null,
         data === null
           ? div({ className: 'mf-empty' }, t('qvLoading'))
           : rows.length === 0
@@ -2700,6 +2803,9 @@ window.__ModuleLoader__.load({
                 templateName,
                 busy,
                 onClear: (sessionId) => void clearOne(sessionId),
+                // 会话号由这一行自己带进去：叉叉长在哪个会话卡上，删的就是哪个会话
+                // 的那条记录 —— 不用用户先「选中」什么，也没有第二种解释。
+                onForget: (item, kind) => void forgetOne(item, kind, row.sessionId),
                 onCopyError: (item, chipKey) => void copyError(item, chipKey),
                 copiedKey: copied,
                 nowMs,

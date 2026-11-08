@@ -696,6 +696,23 @@ const sessionRow = (overrides) => ({
   ...overrides,
 })
 
+/** 有隔离的会话行，用来喂每一行右边那个解除按钮。 */
+const stuckRow = (sessionId, overrides) => sessionRow({
+  sessionId,
+  quarantined: [{ key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId, label: 'Code99 · Beta One' }],
+  ...overrides,
+})
+
+/** 一行一个解除按钮，按渲染顺序（当前会话被提到最前）。 */
+const clearButtons = (runtime) => runtime.nodes.filter(
+  (node) => String(node.props?.className ?? '').includes('mf-qv-clear'),
+)
+
+/** 名单上每颗胶囊左边那颗叉叉，按渲染顺序。 */
+const forgetButtons = (runtime) => runtime.nodes.filter(
+  (node) => node.tag === 'button' && String(node.props?.className ?? '').includes('mf-qv-x'),
+)
+
 await check('隔离队列：注册成 conversation.view，排在 chat 与详情右边，标题走字典', () => {
   const definition = sections[2].definition
   assert.equal(definition.name, 'conversation.view')
@@ -859,6 +876,164 @@ await check('隔离队列：右键复制失败时如实报错，不假装复制�
   }
   assert.ok(!flat.includes('已复制'), '没写进剪贴板就不能说「已复制」')
   assert.ok(flat.includes('复制失败'), '要告诉用户复制没成')
+})
+
+await check('隔离队列：已隔离和已验证的每一条左边都有一颗叉叉，按记录条数长', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-mine',
+      quarantined: [
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId: 's-mine', templateId: 'default', label: 'Code99 · Beta One' },
+        { key: KEY('gamma', 'two'), provider: 'gamma', model: 'two', code: 'SERVER', message: '挂了', at, sessionId: 's-mine', templateId: 'default', label: 'FutureHub · Gamma Two' },
+      ],
+      good: [
+        { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' },
+      ],
+    }),
+  ])
+  let xs
+  let buttons
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    xs = forgetButtons(fresh)
+    buttons = clearButtons(fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(xs.length, 3, '两条隔离 + 一条已验证，各一颗叉叉')
+  assert.equal(xs.every((node) => node.text === '✕'), true, '叉叉就是那颗 ✕')
+  // 两颗胶囊各自可点，不共用同一个回调。
+  assert.equal(typeof xs[0].props.onClick, 'function', '点得动')
+  assert.equal(buttons.length, 1, '「解除隔离」那个整会话按钮还在，两者并存不冲突')
+})
+
+await check('隔离队列：点一条的叉叉只删这一条，请求带的是它自己的 key/templateId/kind', async () => {
+  const fresh = new Runtime()
+  const asked = []
+  const saved = globalThis.fetch
+  let payload = [sessionRow({
+    sessionId: 's-mine',
+    quarantined: [
+      { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId: 's-mine', templateId: 'default', label: 'Code99 · Beta One' },
+      { key: KEY('gamma', 'two'), provider: 'gamma', model: 'two', code: 'SERVER', message: '挂了', at, sessionId: 's-mine', templateId: 'default', label: 'FutureHub · Gamma Two' },
+    ],
+  })]
+  globalThis.fetch = async (url, options) => {
+    const target = String(url)
+    asked.push({ url: target, method: options?.method ?? 'GET', body: options?.body })
+    if ((options?.method ?? 'GET') === 'POST') {
+      // 宿主只划掉那一条：响应回来的列表里 gamma 不见了，beta 还挂着。
+      payload = [sessionRow({
+        sessionId: 's-mine',
+        quarantined: [{ key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId: 's-mine', templateId: 'default', label: 'Code99 · Beta One' }],
+      })]
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          removed: true,
+          sessions: payload,
+          now: at,
+          day: '2026-11-27',
+          route: { provider: 'model-failover', label: '模型接力' },
+          templates: [{ id: 'default', name: '默认模板' }],
+          view: { subagentSessions: false, foreignSessions: true },
+        }),
+      }
+    }
+    return sessionsPayload(payload)
+  }
+  let flat
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    // 第二颗叉叉属于 gamma/two（宿主给的顺序就是渲染顺序）。
+    await forgetButtons(fresh)[1].props.onClick()
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-mine', t })))
+  } finally {
+    globalThis.fetch = saved
+  }
+  const posted = asked.filter((row) => row.method === 'POST')
+  assert.equal(posted.length >= 1, true, '叉叉应当真的发一次 POST')
+  assert.equal(
+    posted.every((row) => row.url.includes('/forget-record')),
+    true,
+    `只该打 /forget-record，实际：${JSON.stringify(posted.map((row) => row.url))}`,
+  )
+  const body = JSON.parse(posted[0].body)
+  assert.deepEqual(
+    body,
+    { sessionId: 's-mine', templateId: 'default', key: KEY('gamma', 'two'), kind: 'quarantine' },
+    '必须点名是哪一条：会话 + 模板 + 模型 + 哪份名单',
+  )
+  assert.equal(flat.includes('FutureHub · Gamma Two'), false, '删掉的那一条应当跟着响应消失')
+  assert.ok(flat.includes('Code99 · Beta One'), `另一条隔离必须还在，实际：${flat.slice(0, 400)}`)
+})
+
+await check('隔离队列：「已验证」那条的叉叉发的是 kind=good，不按隔离处理', async () => {
+  const fresh = new Runtime()
+  const asked = []
+  const saved = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    asked.push({ url: String(url), method: options?.method ?? 'GET', body: options?.body })
+    if ((options?.method ?? 'GET') === 'POST') {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          removed: true,
+          sessions: [sessionRow({ sessionId: 's-mine' })],
+          now: at,
+          day: '2026-11-27',
+          route: { provider: 'model-failover', label: '模型接力' },
+          templates: [{ id: 'default', name: '默认模板' }],
+          view: { subagentSessions: false, foreignSessions: true },
+        }),
+      }
+    }
+    return sessionsPayload([sessionRow({
+      sessionId: 's-mine',
+      good: [
+        { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'spare', label: '硅基流动 · Alpha One' },
+      ],
+    })])
+  }
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    await forgetButtons(fresh)[0].props.onClick()
+  } finally {
+    globalThis.fetch = saved
+  }
+  const posted = asked.filter((row) => row.method === 'POST')
+  assert.equal(posted.length >= 1, true)
+  assert.equal(JSON.parse(posted[0].body).kind, 'good', '这份名单是「已验证」，kind 必须说清楚')
+  assert.equal(JSON.parse(posted[0].body).templateId, 'spare', '模板 id 原样带出去')
+})
+
+await check('隔离队列：划记录失败时如实报错，不假装删掉了', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if ((options?.method ?? 'GET') === 'POST') {
+      return { ok: false, status: 500, text: async () => JSON.stringify({ ok: false, error: '磁盘满了' }) }
+    }
+    return sessionsPayload([stuckRow('s-mine')])
+  }
+  let flat
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    await forgetButtons(fresh)[0].props.onClick()
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-mine', t })))
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.ok(flat.includes('磁盘满了'), `要带上宿主那句真话，实际：${flat.slice(0, 400)}`)
+  // 别把它说成「读取失败」——那会让人以为只是没刷新。
+  assert.equal(flat.includes('读取失败'), false, '写失败不该借用读取失败的文案')
+  assert.ok(flat.includes('Code99 · Beta One'), '没删成就得原样留着')
 })
 
 await check('隔离队列：已隔离和已验证的模型后面各跟一个蓝框写输出速度', async () => {
@@ -1153,18 +1328,6 @@ await check('隔离队列：手动刷新再问一次 /sessions，不会改任何
 
 // ── 解除隔离的按钮（长在每个会话行上，只解那一个会话） ────────────────────────
 
-/** 有隔离的会话行，用来喂每一行右边那个解除按钮。 */
-const stuckRow = (sessionId, overrides) => sessionRow({
-  sessionId,
-  quarantined: [{ key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId, label: 'Code99 · Beta One' }],
-  ...overrides,
-})
-
-/** 一行一个解除按钮，按渲染顺序（当前会话被提到最前）。 */
-const clearButtons = (runtime) => runtime.nodes.filter(
-  (node) => String(node.props?.className ?? '').includes('mf-qv-clear'),
-)
-
 await check('设置页不再有「解除今日隔离」按钮：那件事挪到会话页去了，且只解那一个会话', () => {
   const labels = runtime.nodes.filter((node) => node.tag === 'button').map((node) => node.text)
   assert.equal(labels.includes('解除今日隔离'), false, '设置页那个全局解除按钮应当已经撤掉')
@@ -1369,29 +1532,46 @@ await check('隔离队列：正在跑的那个标成实时——它的时长从�
   )
 })
 
-await check('隔离队列：「并发限制」一栏只列设了上限的模型，并报出占用', async () => {
+await check('隔离队列：并发一栏只画宿主报的那一个模型 —— 它只报当前模型，前端照着画', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 宿主只报一条（见 index.js 的 sessionRows）：这里就只喂一条，验的是「前端
+  // 不自己加戏」—— 不补画、不按模板去猜别的候选。
+  globalThis.fetch = async () => sessionsPayload([timedRow({
+    capped: [
+      { key: KEY('beta', 'one'), cap: 2, used: 2, holders: ['s1', 's2'], provider: 'beta', model: 'one', label: 'Code99 · Beta One' },
+    ],
+  })])
+  let chips
+  try {
+    await fresh.mount(queue({ sessionId: 'other', t }))
+    chips = roleChips('qv-cap', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(chips.length, 1, '只有一条就只画一颗')
+  assert.equal(String(chips[0].props.className).includes('mf-bad'), true, '占满的那颗要标红')
+  assert.equal(chips[0].props.title.includes('已经占满'), true, `占满的走「已经占满」的悬停文案，实际：${chips[0].props.title}`)
+})
+
+await check('隔离队列：并发那一栏在还有空位时给出「还有空位」的说法，不标红', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch
   globalThis.fetch = async () => sessionsPayload([timedRow({
     capped: [
-      { key: KEY('beta', 'one'), cap: 2, used: 2, holders: ['s1', 's2'], provider: 'beta', model: 'one', label: 'Code99 · Beta One' },
       { key: KEY('gamma', 'two'), cap: 3, used: 1, holders: ['s1'], provider: 'gamma', model: 'two', label: 'FutureHub · Gamma Two' },
     ],
   })])
   let chips
-  let flat
   try {
     await fresh.mount(queue({ sessionId: 'other', t }))
     chips = roleChips('qv-cap', fresh)
-    flat = fresh.text(fresh.nodes.find((node) => String(node.props?.className ?? '').includes('mf-qv')) ?? fresh.nodes[0])
   } finally {
     globalThis.fetch = saved
   }
-  assert.equal(chips.length, 2, '设了两个上限就画两颗')
-  assert.equal(String(chips[0].props.className).includes('mf-bad'), true, '占满的那颗要标红')
-  assert.equal(String(chips[1].props.className).includes('mf-bad'), false, '还有空位的不标红')
-  assert.equal(chips[0].props.title.includes('已经占满'), true, `占满的走「已经占满」的悬停文案，实际：${chips[0].props.title}`)
-  assert.equal(chips[1].props.title.includes('还有空位'), true, `没占满的要说清还有空位，实际：${chips[1].props.title}`)
+  assert.equal(chips.length, 1)
+  assert.equal(String(chips[0].props.className).includes('mf-bad'), false, '还有空位的不标红')
+  assert.equal(chips[0].props.title.includes('还有空位'), true, `没占满的要说清还有空位，实际：${chips[0].props.title}`)
 })
 
 await check('隔离队列：没有任何模型设并发上限时，「并发限制」那一行整个不画', async () => {
