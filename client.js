@@ -167,6 +167,9 @@ window.__ModuleLoader__.load({
 .mf-qv-item { display: inline-flex; align-items: baseline; gap: 6px; padding: 1px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 11.5px; }
 .mf-qv-item.mf-bad { border-color: color-mix(in srgb, #e5484d 55%, transparent); color: #e5484d; }
 .mf-qv-item.mf-ok { border-color: color-mix(in srgb, #30a46c 55%, transparent); color: #30a46c; }
+/* 设了上限、此刻却没人在用的候选：它确实生效着，只是眼下空着。淡一档，别跟
+   正在被占着的那几颗抢注意力，但也绝不能藏起来 —— 藏了就等于「我的设置没生效」。 */
+.mf-qv-item.mf-idle { opacity: .5; border-style: dashed; }
 .mf-qv-item > .mf-qv-code { opacity: .65; }
 /* 右键就能整块复制，鼠标形状得先说明这件事。 */
 .mf-qv-item.mf-copyable { cursor: context-menu; }
@@ -391,7 +394,7 @@ window.__ModuleLoader__.load({
         qvCapped: '并发限制',
         qvCapHint: '这个模型设了并发上限：现在有 {used} 个会话占着它，上限 {cap}。还有空位时别的会话照用；已经在用的会话会一直占着。',
         qvCapFullHint: '这个模型已经占满（{used}/{cap}），别的会话这一趟会跳过它去用队列里的下一个；等占着它的会话在它身上报错、或者会话结束，才会空出来。',
-        qvCapMine: '我也在里面',
+        qvCapMine: '包含本会话',
         qvCapHolders: '占着的会话：{list}',
         qvTemplate: '模板「{name}」',
         templateDeleteConfirm: '确定删掉模板「{name}」吗？队列里的 {count} 个模型会一起消失。',
@@ -597,7 +600,7 @@ window.__ModuleLoader__.load({
         qvCapped: 'Concurrency',
         qvCapHint: 'This model has a concurrency limit: {used} conversation(s) holding it now, limit {cap}. Others still join while a slot is free; whoever joined keeps it.',
         qvCapFullHint: 'This model is full ({used}/{cap}). Other conversations skip it and take the next model in the queue; a slot frees up when a holder errors on it or its conversation ends.',
-        qvCapMine: 'you are one of them',
+        qvCapMine: 'includes this session',
         qvCapHolders: 'Held by: {list}',
         qvTemplate: 'template “{name}”',
         templateDeleteConfirm: 'Delete the template “{name}”? Its {count} models go with it.',
@@ -2753,15 +2756,27 @@ window.__ModuleLoader__.load({
         }, 1600)
       }, [t, templateName])
 
-      // 谁正占着并发名额 —— 整屏共用一份，不拆到每个会话行里。
+      // 并发名额此刻被谁占着 —— 整屏共用一份，不拆到每个会话行里。
       //
       // 这一份回答的是「我现在等的那个模型是被谁占着」，所以它必须**跨会话**
       // 合计：占着名额的很可能是别的会话，甚至是这一屏里根本没画出来的会话
       // （被「外观」藏掉的子智能体）。拆到行上就答不了这个问题了。
       //
-      // 空着不用的候选不进来：设了上限却没人用的模型可以有十几个，摊在这里
-      // 只会把真正在用的那几行淹掉。要看全量去设置页。
-      const inUse = Array.isArray(data?.limits) ? data.limits : []
+      // 里面**也包含此刻空着的**（宿主发的是全量）：只画被占着的，一旦没人占，
+      // 这一栏就整块消失 —— 而「没人占」和「压根没配并发上限」在界面上长得一模
+      // 一样，用户没法分辨是不是自己的设置没生效。空着的那几颗淡着画。
+      //
+      // 兜底：宿主是**半身**加载的（`index.js` 随 DSH 启动，`client.js` 随页面
+      // 刷新），两边会短暂错版 —— 旧宿主把占用挂在每个会话行的 `capped` 上。
+      // 顶层没有就从行里拼回来，否则刚刷新页面这一栏会整块消失，直到重启 DSH。
+      const capacity = Array.isArray(data?.limits)
+        ? data.limits
+        : [...new Map(
+            (data?.sessions ?? [])
+              .flatMap((row) => (Array.isArray(row?.capped) ? row.capped : []))
+              .filter((item) => typeof item?.key === 'string')
+              .map((item) => [item.key, item]),
+          ).values()]
 
       return div({ className: 'mf-qv' },
         div({ className: 'mf-qv-head' },
@@ -2777,27 +2792,29 @@ window.__ModuleLoader__.load({
         div({ className: 'mf-note' }, t('qvHint')),
         error !== '' ? div({ className: 'mf-err' }, t('qvFailed', { message: error })) : null,
         actionError !== '' ? div({ className: 'mf-err' }, actionError) : null,
-        // 「并发占用」：全机器此刻被占着的那几格。整屏一份，放在会话列表**上面**
-        // —— 它说的是「现在谁在挡路」，那正是往下看这几行时要先知道的事。
+        // 「并发限制」：全机器此刻被占着的那几格，外加空着的。整屏一份，放在会话
+        // 列表**上面** —— 它说的是「现在谁在挡路」，那正是往下看这几行时要先知道
+        // 的事；而没有会话行时（这一栏只列跑过插件的会话）它也能照常显示。
         //
-        // 只列**有人在用**的：设了上限却空着的候选可以有十几个，列出来只会把
-        // 真正在用的那几行淹掉。占着它的会话号写进悬停，不铺在行里 —— 会话号是
-        // 完整的 `session-<uuid>`，一行放两三个就把面板撑出横向滚动条。
-        inUse.length === 0
+        // 占着它的会话号写进悬停，不铺在行里 —— 会话号是完整的 `session-<uuid>`，
+        // 一行放两三个就把面板撑出横向滚动条。
+        capacity.length === 0
           ? null
           : div({ className: 'mf-qv-caps' },
               span({ className: 'mf-qv-label' }, t('qvCapped')),
               div({ className: 'mf-qv-list' },
-                ...inUse.map((item) => {
+                ...capacity.map((item) => {
                   const used = Number.isFinite(item.used) ? item.used : 0
                   const cap = Number.isFinite(item.cap) ? item.cap : 0
                   const full = cap > 0 && used >= cap
+                  const idle = used === 0
                   const holders = Array.isArray(item.holders) ? item.holders : []
                   const base = full
                     ? t('qvCapFullHint', { used, cap })
                     : t('qvCapHint', { used, cap })
                   return span({
-                    className: full ? 'mf-qv-item mf-bad' : 'mf-qv-item',
+                    // 空着的淡一档：它确实设了上限，只是现在没人在用。
+                    className: `mf-qv-item${full ? ' mf-bad' : ''}${idle ? ' mf-idle' : ''}`,
                     key: item.key,
                     'data-role': 'qv-cap',
                     title: holders.length === 0

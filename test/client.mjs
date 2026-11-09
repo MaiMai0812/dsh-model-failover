@@ -672,7 +672,12 @@ await check('轮尾小字：3 秒 TTL 内不重复问，换一个轮号才会再
 
 const queue = sections[2].component
 
-/** `/sessions` 的假后端。`limits` 是整屏一份的并发占用（跨会话），不是某一行的。 */
+/**
+ * `/sessions` 的假后端。`limits` 是整屏一份的并发限制（跨会话），不是某一行的。
+ *
+ * 传 `null` 表示**这份响应里根本没有这个字段** —— 用来模拟「新前端配旧宿主」
+ * 那种半身错版：那时占用还挂在每一行的 `capped` 上。
+ */
 const sessionsPayload = (sessions, day = '2026-11-27', view = { subagentSessions: false, foreignSessions: true }, limits = []) => ({
   ok: true,
   status: 200,
@@ -684,7 +689,7 @@ const sessionsPayload = (sessions, day = '2026-11-27', view = { subagentSessions
     // 隔离条目上只带模板 id，名字得从这里换。
     templates: [{ id: 'default', name: '默认模板' }, { id: 'spare', name: '备用模板' }],
     view,
-    limits,
+    ...(limits === null ? {} : { limits }),
     sessions,
   }),
 })
@@ -1533,12 +1538,12 @@ await check('隔离队列：正在跑的那个标成实时——它的时长从�
   )
 })
 
-await check('隔离队列：并发占用整屏一份，跨会话列出正在被占着的那几个', async () => {
+await check('隔离队列：并发限制整屏一份，跨会话列出所有设了上限的模型', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch
   // 两个会话各占着 alpha/one 的一格（上限 2，正好占满）；另有一个候选 beta/one
-  // 上限 2 只占了一格。整屏那一栏要看到三条里全部（都是 used > 0），与「当前会话
-  // 用的是谁」无关 —— 这里当前会话 s-mine 根本不在任何 holders 里。
+  // 上限 2 只占了一格。整屏那一栏要全看到，与「当前会话用的是谁」无关 ——
+  // 这里当前会话 s-mine 根本不在任何 holders 里。
   globalThis.fetch = async () => sessionsPayload(
     [sessionRow({ sessionId: 's-mine' })],
     '2026-11-27',
@@ -1556,7 +1561,7 @@ await check('隔离队列：并发占用整屏一份，跨会话列出正在被�
   } finally {
     globalThis.fetch = saved
   }
-  assert.equal(chips.length, 2, `有人在用的两条都要画，实际：${chips.length}`)
+  assert.equal(chips.length, 2, `设了上限的两条都要画，实际：${chips.length}`)
   assert.equal(String(chips[0].props.className).includes('mf-bad'), true, '占满的标红')
   assert.equal(String(chips[1].props.className).includes('mf-bad'), false, '还有空位的不标红')
   assert.equal(flat.includes('2/2'), true, '占满的那个要报出 2/2')
@@ -1564,11 +1569,50 @@ await check('隔离队列：并发占用整屏一份，跨会话列出正在被�
   // 别的会话占着也算数：占它们的会话号写在悬停里，一个都不许漏。
   assert.ok(chips[0].props.title.includes('session-aaa'), `要给出占着的是谁，实际：${chips[0].props.title}`)
   assert.ok(chips[0].props.title.includes('session-bbb'), `两个都要给，实际：${chips[0].props.title}`)
-  // 当前会话不在里面时不该说「我也在里面」。
-  assert.equal(flat.includes('我也在里面'), false, '当前会话没占着它，就别乱认')
+  // 当前会话不在里面时不该说「包含本会话」。
+  assert.equal(flat.includes('包含本会话'), false, '当前会话没占着它，就别乱认')
 })
 
-await check('隔离队列：占着的会话里有自己时，那一颗上标一句「我也在里面」', async () => {
+await check('隔离队列：现在没人在用也照画，只是淡着 —— 别让「都空着」看起来像「没配上限」', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 这是用户报的那个故障：设了上限但此刻一个会话都没跑，整栏就别消失了。
+  globalThis.fetch = async () => sessionsPayload(
+    [sessionRow({})],
+    '2026-11-27',
+    { subagentSessions: false, foreignSessions: true },
+    [
+      { key: KEY('alpha', 'one'), cap: 2, used: 0, holders: [], provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One' },
+      { key: KEY('beta', 'one'), cap: 1, used: 0, holders: [], provider: 'beta', model: 'one', label: 'Code99 · Beta One' },
+    ],
+  )
+  let chips
+  let flat
+  try {
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 'other', t })))
+    chips = roleChips('qv-cap', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(chips.length, 2, `空着的两条也要画，实际：${chips.length}`)
+  assert.equal(String(chips[0].props.className).includes('mf-idle'), true, '空着的要淡一档')
+  assert.equal(String(chips[0].props.className).includes('mf-bad'), false, '空着的不标红（它不是「占满」）')
+  assert.equal(flat.includes('0/2'), true, '空着就报 0/2')
+  // 一条上限都没配时才是真没得画。
+  const bare = new Runtime()
+  const saved2 = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([sessionRow({})])
+  let none
+  try {
+    await bare.mount(queue({ sessionId: 'other', t }))
+    none = roleChips('qv-cap', bare)
+  } finally {
+    globalThis.fetch = saved2
+  }
+  assert.equal(none.length, 0, '一条上限都没配，这一栏才该整块不画')
+})
+
+await check('隔离队列：占着的会话里有自己时，那一颗上标一句「包含本会话」', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch
   globalThis.fetch = async () => sessionsPayload(
@@ -1585,27 +1629,34 @@ await check('隔离队列：占着的会话里有自己时，那一颗上标一�
   } finally {
     globalThis.fetch = saved
   }
-  assert.equal(flat.includes('我也在里面'), true, `自己占着要说清，实际：${flat.slice(0, 500)}`)
+  assert.equal(flat.includes('包含本会话'), true, `自己占着要说清，实际：${flat.slice(0, 500)}`)
 })
 
-await check('隔离队列：没有任何并发名额被占着时，整块不画', async () => {
+await check('隔离队列：宿主还是老版本（占用挂在会话行上）时，那一栏照样画得出来', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch
-  // 设了上限但空着：宿主不发空行，所以这里喂空数组。
-  globalThis.fetch = async () => sessionsPayload(
-    [sessionRow({})],
-    '2026-11-27',
-    { subagentSessions: false, foreignSessions: true },
-    [],
-  )
+  // 半身错版：`index.js` 已经换成顶层 `limits`，但页面上跑的还是上一版 client.js，
+  // 或者反过来 —— 新前端配旧宿主时顶层没有 limits，占用还挂在每一行的 capped 上。
+  // 这时如果只看顶层，用户刷新页面后这一栏会整块消失，直到 DSH 重启。
+  const payload = sessionsPayload([sessionRow({
+    sessionId: 's-old',
+    capped: [
+      { key: KEY('alpha', 'one'), cap: 2, used: 1, holders: ['s-old'], provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One' },
+    ],
+  })], '2026-11-27', { subagentSessions: false, foreignSessions: true }, null)
+  globalThis.fetch = async () => payload
   let chips
+  let flat
   try {
-    await fresh.mount(queue({ sessionId: 'other', t }))
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-old', t })))
     chips = roleChips('qv-cap', fresh)
   } finally {
     globalThis.fetch = saved
   }
-  assert.equal(chips.length, 0, '没人在用就不该给这一栏占地方')
+  assert.equal(chips.length, 1, `旧宿主的行级字段要能兜住，实际：${chips.length}`)
+  assert.equal(flat.includes('1/2'), true, '占用数字照样报出来')
+  assert.equal(flat.includes('硅基流动 · Alpha One'), true, '模型名照样有')
+  assert.ok(String(chips[0].props.title).includes('s-old'), `占着的会话号也要跟着，实际：${chips[0].props.title}`)
 })
 
 // ── 首帧 / 错误态（各自一个全新的渲染器，避免和别的用例串味） ────────────────

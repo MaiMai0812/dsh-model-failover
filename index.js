@@ -439,27 +439,6 @@ export function apply(ctx, _config) {
     return limits.view(caps).map((row) => ({ ...row, label: labelOf(row.provider, row.model) }))
   }
 
-  /**
-   * **正在被占用**的那些并发上限（跨模板去重，全机器合计）。
-   *
-   * 会话页那一栏回答的是「现在有谁在占着并发名额」，这跟「我这个会话用的是谁」
-   * 不是同一个问题：别的会话占着同一个模型同样是事实，而且恰恰是你这一趟被跳过
-   * 的原因 —— 只报自己那一个，看到「满员」时就无从知道是谁占着、还有几个人在等。
-   *
-   * 空着的候选**不进**这份名单：设了上限却没人用的模型动辄十几个，摊在会话页上
-   * 只会把真正在用的那几行淹掉。要看全部（含空着的）去设置页，那里是 `limitsView`
-   * 的全量。
-   */
-  const limitsInUse = () => {
-    const caps = new Map()
-    for (const template of settingsFile.get().templates) {
-      for (const [key, meta] of capsFor(template.id)) if (!caps.has(key)) caps.set(key, meta)
-    }
-    // `view()` 已经按占用从多到少排好，这里只筛掉没人在用的。
-    return limits.view(caps)
-      .filter((row) => row.used > 0)
-      .map((row) => ({ ...row, label: labelOf(row.provider, row.model) }))
-  }
 
   const adapter = new FailoverAdapter({
     llm: ctx.llm,
@@ -832,11 +811,15 @@ export function apply(ctx, _config) {
             subagentSessions: settingsFile.get().showSubagentSessions === true,
             foreignSessions: settingsFile.get().showForeignSessions !== false,
           },
-          // 谁正占着并发名额 —— **跨会话、跨模板**的实时账，不含空着的候选。
-          // 它挂在响应顶层而不是某个会话行上：占着名额的可能是别的会话，甚至是
-          // 这一屏里根本没出现的会话（被「外观」藏掉的子智能体）。按行拆开，
-          // 用户就看不出「我正在等的那个模型是被谁占着」。
-          limits: limitsInUse(),
+          // 并发名额此刻被谁占着 —— **跨会话、跨模板**的一份，挂在响应顶层而不是
+          // 某个会话行上：占着名额的可能是别的会话，甚至是这一屏里根本没出现的
+          // 会话（被「外观」藏掉的子智能体）。按行拆开，用户就看不出「我在等的
+          // 那个模型是被谁占着」。
+          //
+          // 给的是**全部**设了上限的候选（含此刻空着的）：只发正在被占用的，
+          // 一旦没人占，这一栏会整块消失 —— 而它消失的原因和「这台机器没配并发
+          // 上限」长得一模一样，用户没法分辨。空着的那些在界面上淡着显示。
+          limits: limitsView(undefined),
           sessions: sessionRows(now),
         })
         return

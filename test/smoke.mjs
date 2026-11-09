@@ -2318,10 +2318,11 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(afterRecord.good.length, 0, '「已验证」这一条没了')
     assert.equal(afterRecord.quarantined.length, recorded.quarantined.length, '隔离那几条一条都不许被顺手删掉')
 
-    // ── 并发占用：跨会话的实时账，只列有人在用的 ────────────────────────────
+    // ── 并发限制：跨会话的实时账，含此刻空着的候选 ──────────────────────────
     // 两个候选都设了上限：alpha 跑了两个会话（上限 2，占满），beta 一个都没跑
-    // （上限 1，空着）。会话页那一栏要报的是「谁正占着名额」，所以只该出现
-    // alpha；空着的 beta 不进这份名单 —— 它一栏不占地方，但设置页那份全量里有它。
+    // （上限 1，空着）。会话页那一栏给的是**全量**：空着的 beta 也得在，否则
+    // 「没人占」和「压根没配上限」在界面上长得一模一样，用户分不出是自己的设置
+    // 没生效还是眼下正好空着。
     const capped = await call('POST', '/api/dsh-model-failover/settings', {
       templates: [{
         id: 'default',
@@ -2333,6 +2334,11 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
       }],
     })
     assert.equal(capped.status, 200)
+    // 配好人还没跑：两条都空着，但这一栏就得已经在了。
+    const idleView = await call('GET', '/api/dsh-model-failover/sessions')
+    assert.equal(Array.isArray(idleView.json.limits), true, '/sessions 要带上并发限制')
+    assert.equal(idleView.json.limits.length, 2, `没人在用时也要报全量，实际：${JSON.stringify(idleView.json.limits)}`)
+    assert.equal(idleView.json.limits.every((row) => row.used === 0), true, '都还空着')
     for await (const _ of registrations[0].adapter.stream({
       provider: ROUTE,
       model: 'auto',
@@ -2341,14 +2347,19 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     })) { /* 把流跑完 */ }
     const cappedView = await call('GET', '/api/dsh-model-failover/sessions')
     const alphaKey = routeKey('alpha', 'one')
-    assert.equal(Array.isArray(cappedView.json.limits), true, '/sessions 要带上并发占用')
     const inUse = cappedView.json.limits
-    assert.equal(inUse.length, 1, `只列有人在用的，实际：${JSON.stringify(inUse)}`)
-    assert.equal(inUse[0].key, alphaKey, '在用的就是它')
-    assert.equal(inUse[0].cap, 2, '上限原样带出来')
-    assert.equal(inUse[0].used, 1, '一个会话占着')
-    assert.deepEqual(inUse[0].holders, ['sess-capped'], '占着的是谁也要给出来')
-    assert.equal(cappedView.json.limits.some((row) => row.key === routeKey('beta', 'one')), false, '空着的候选不进这一份')
+    assert.equal(inUse.length, 2, `全量都在，实际：${JSON.stringify(inUse)}`)
+    const alphaRow = inUse.find((row) => row.key === alphaKey)
+    assert.ok(alphaRow !== undefined, '在用的那个要在')
+    assert.equal(alphaRow.cap, 2, '上限原样带出来')
+    assert.equal(alphaRow.used, 1, '一个会话占着')
+    assert.deepEqual(alphaRow.holders, ['sess-capped'], '占着的是谁也要给出来')
+    const betaIdle = inUse.find((row) => row.key === routeKey('beta', 'one'))
+    assert.ok(betaIdle !== undefined, '空着的那个也要在（否则分不出「没配上限」和「正好空着」）')
+    assert.equal(betaIdle.used, 0, '它确实没人在用')
+    assert.deepEqual(betaIdle.holders, [], '空着的没有占用人')
+    // 占用多的排前面：界面上第一颗就是那个在用的。
+    assert.equal(inUse[0].key, alphaKey, '按占用从多到少排')
 
     // 第二个会话也落在 alpha 上（新会话，队首就是它）：占用变 2/2，两个会话号都在。
     for await (const _ of registrations[0].adapter.stream({
@@ -2364,13 +2375,13 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(two.used, two.cap, '正好占满')
     assert.deepEqual([...two.holders].sort(), ['sess-capped', 'sess-capped-2'], '占着的两个会话号都在')
 
-    // 别的会话占着也算数：三条用例里每次都是**整屏一份**，不按行拆。
+    // 别的会话占着也算数：每次都是**整屏一份**，不按行拆。
     for (const row of twoView.json.sessions) {
       assert.equal('capped' in row, false, `会话行上不该再挂并发字段，实际：${JSON.stringify(row.capped)}`)
     }
-    // 设置页那份快照仍然是全量（含空着的）：它回答的是「这台机器上有哪些模型设了上限」。
+    // 设置页那份快照也是全量，两边口径一致。
     const fullView = await call('GET', '/api/dsh-model-failover/state')
-    assert.equal(fullView.json.limits.length, 2, '设置页要看全部设了上限的模型，这条不能跟着收窄')
+    assert.equal(fullView.json.limits.length, 2, '设置页要看全部设了上限的模型')
 
     // 收摊：把队列、脚本都还原成这一段之前的样子，免得后面「beta 探不通」那几条
     // 被这里临时塞进去的脚本喂成另一个结论。
