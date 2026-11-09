@@ -427,12 +427,8 @@ export function apply(ctx, _config) {
 
   /**
    * 这些上限此刻占了几格。跨模板按候选去重，一个候选最多出现一次。
-   *
-   * `onlyKey` 是给会话页用的：那一栏要说的是「我这个会话现在用的这个模型，还有
-   * 没有名额」，不是「这台机器上有哪些模型设了上限」。一条队列动辄十几个模型，
-   * 全都铺在对应用户正在看的那个会话框里，只会把真正要看的那一行淹掉。
    */
-  const limitsView = (templateId, onlyKey) => {
+  const limitsView = (templateId) => {
     let caps = capsFor(templateId)
     if (templateId === undefined) {
       caps = new Map()
@@ -440,11 +436,29 @@ export function apply(ctx, _config) {
         for (const [key, meta] of capsFor(template.id)) if (!caps.has(key)) caps.set(key, meta)
       }
     }
-    if (typeof onlyKey === 'string') {
-      const one = caps.get(onlyKey)
-      caps = one === undefined ? new Map() : new Map([[onlyKey, one]])
-    }
     return limits.view(caps).map((row) => ({ ...row, label: labelOf(row.provider, row.model) }))
+  }
+
+  /**
+   * **正在被占用**的那些并发上限（跨模板去重，全机器合计）。
+   *
+   * 会话页那一栏回答的是「现在有谁在占着并发名额」，这跟「我这个会话用的是谁」
+   * 不是同一个问题：别的会话占着同一个模型同样是事实，而且恰恰是你这一趟被跳过
+   * 的原因 —— 只报自己那一个，看到「满员」时就无从知道是谁占着、还有几个人在等。
+   *
+   * 空着的候选**不进**这份名单：设了上限却没人用的模型动辄十几个，摊在会话页上
+   * 只会把真正在用的那几行淹掉。要看全部（含空着的）去设置页，那里是 `limitsView`
+   * 的全量。
+   */
+  const limitsInUse = () => {
+    const caps = new Map()
+    for (const template of settingsFile.get().templates) {
+      for (const [key, meta] of capsFor(template.id)) if (!caps.has(key)) caps.set(key, meta)
+    }
+    // `view()` 已经按占用从多到少排好，这里只筛掉没人在用的。
+    return limits.view(caps)
+      .filter((row) => row.used > 0)
+      .map((row) => ({ ...row, label: labelOf(row.provider, row.model) }))
   }
 
   const adapter = new FailoverAdapter({
@@ -647,23 +661,8 @@ export function apply(ctx, _config) {
         templateName: hit.templateId === undefined ? '' : templateName(hit.templateId),
       }
     }
-    // 并发占用：**只说这个会话此刻正在用的那个模型**，不把整条队列里所有设了
-    // 上限的候选铺出来。那一栏回答的是「我现在用的这个还有没有名额」，一条队列
-    // 十几个模型全列出来会把它该说的一句话淹掉。
-    //
-    // 「此刻正在用」与上面「正在用」那一行的口径一致：正在跑的优先，没有就是上
-    // 一趟跑过的。两者都没有（会话还没跑过任何一趟）就没什么「当前模型」可报，
-    // 这一栏整行不画 —— 这跟「候选都没设上限」在界面上是同一个结果，也确实没
-    // 有信息可给。
-    for (const row of table.values()) {
-      const current = row.running ?? row.active
-      if (current === undefined) {
-        row.capped = []
-        continue
-      }
-      const templateId = current.templateId ?? DEFAULT_TEMPLATE_ID
-      row.capped = limitsView(templateId, routeKey(current.provider, current.model))
-    }
+    // 并发占用不再挂在每一行会话上：它是**全机器**的一件事（谁正占着哪几个名额），
+    // 而每一行只说「这个会话」。会话页顶部那一栏去读 `/sessions` 里的 `limits`。
     // 有事的会话排前面：隔离着的 → 正在跑的 → 其余。
     return [...table.values()].sort((left, right) => {
       const weight = (row) => (row.quarantined.length > 0 ? 0 : row.active !== undefined || row.running !== undefined ? 1 : 2)
@@ -833,6 +832,11 @@ export function apply(ctx, _config) {
             subagentSessions: settingsFile.get().showSubagentSessions === true,
             foreignSessions: settingsFile.get().showForeignSessions !== false,
           },
+          // 谁正占着并发名额 —— **跨会话、跨模板**的实时账，不含空着的候选。
+          // 它挂在响应顶层而不是某个会话行上：占着名额的可能是别的会话，甚至是
+          // 这一屏里根本没出现的会话（被「外观」藏掉的子智能体）。按行拆开，
+          // 用户就看不出「我正在等的那个模型是被谁占着」。
+          limits: limitsInUse(),
           sessions: sessionRows(now),
         })
         return

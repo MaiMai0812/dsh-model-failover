@@ -159,6 +159,8 @@ window.__ModuleLoader__.load({
 .mf-qv-id { flex: none; opacity: .45; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 .mf-qv-clear { flex: none; font-size: 11.5px; padding: 1px 8px; }
 .mf-qv-line { display: flex; align-items: baseline; gap: 8px; }
+/* 「并发占用」一整块：它不属于任何一个会话，所以单独一块，跟下面那些会话卡拉开。 */
+.mf-qv-caps { display: flex; align-items: baseline; gap: 8px; padding: 8px 12px; border-radius: 10px; border: 1px dashed color-mix(in srgb, currentColor 18%, transparent); }
 .mf-qv-label { flex: none; width: 4.5em; opacity: .55; font-size: 11.5px; }
 .mf-qv-value { flex: 1; min-width: 0; word-break: break-word; }
 .mf-qv-list { flex: 1; min-width: 0; display: flex; flex-wrap: wrap; gap: 4px 8px; }
@@ -389,6 +391,8 @@ window.__ModuleLoader__.load({
         qvCapped: '并发限制',
         qvCapHint: '这个模型设了并发上限：现在有 {used} 个会话占着它，上限 {cap}。还有空位时别的会话照用；已经在用的会话会一直占着。',
         qvCapFullHint: '这个模型已经占满（{used}/{cap}），别的会话这一趟会跳过它去用队列里的下一个；等占着它的会话在它身上报错、或者会话结束，才会空出来。',
+        qvCapMine: '我也在里面',
+        qvCapHolders: '占着的会话：{list}',
         qvTemplate: '模板「{name}」',
         templateDeleteConfirm: '确定删掉模板「{name}」吗？队列里的 {count} 个模型会一起消失。',
         templateDeleteYes: '删掉',
@@ -593,6 +597,8 @@ window.__ModuleLoader__.load({
         qvCapped: 'Concurrency',
         qvCapHint: 'This model has a concurrency limit: {used} conversation(s) holding it now, limit {cap}. Others still join while a slot is free; whoever joined keeps it.',
         qvCapFullHint: 'This model is full ({used}/{cap}). Other conversations skip it and take the next model in the queue; a slot frees up when a holder errors on it or its conversation ends.',
+        qvCapMine: 'you are one of them',
+        qvCapHolders: 'Held by: {list}',
         qvTemplate: 'template “{name}”',
         templateDeleteConfirm: 'Delete the template “{name}”? Its {count} models go with it.',
         templateDeleteYes: 'Delete',
@@ -2358,8 +2364,6 @@ window.__ModuleLoader__.load({
     function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, busy, onCopyError, copiedKey, nowMs }) {
       const quarantined = row?.quarantined ?? []
       const good = row?.good ?? []
-      /** 这个会话**此刻在用的那个模型**的并发占用（宿主只报这一条，见 index.js）。 */
-      const capped = row?.capped ?? []
       const active = row?.active
       const activeTemplate = typeof active?.templateName === 'string' && active.templateName !== ''
         ? active.templateName
@@ -2514,33 +2518,6 @@ window.__ModuleLoader__.load({
                   className: 'mf-qv-item mf-ok',
                   key: `${item.key ?? ''}\u0000${item.templateId ?? ''}`,
                 }, forgetButton(item, 'good'), sessionItemLabel(item), speedChip(item), timeChip(item))),
-              ),
-            ),
-        // 「并发限制」：只画**这个会话当前用的那个模型**，宿主只报这一条（见
-        // index.js 的 sessionRows）。早先这里会把整条队列里所有设了上限的候选都
-        // 铺出来 —— 一条队列十几个模型，真正要看的那一行反倒被淹掉了。它跟隔离、
-        // 验证不在一条轴上，所以单开一行；没有上限就整行不画，不给空名单占地方。
-        capped.length === 0
-          ? null
-          : div({ className: 'mf-qv-line' },
-              span({ className: 'mf-qv-label' }, t('qvCapped')),
-              div({ className: 'mf-qv-list' },
-                ...capped.map((item) => {
-                  const used = Number.isFinite(item.used) ? item.used : 0
-                  const cap = Number.isFinite(item.cap) ? item.cap : 0
-                  const full = cap > 0 && used >= cap
-                  return h('span', {
-                    className: full ? 'mf-qv-item mf-bad' : 'mf-qv-item',
-                    key: item.key,
-                    'data-role': 'qv-cap',
-                    title: full
-                      ? t('qvCapFullHint', { used, cap })
-                      : t('qvCapHint', { used, cap }),
-                  },
-                    sessionItemLabel(item),
-                    span({ className: 'mf-qv-code' }, ` · ${t('capLabel', { used, cap })}`),
-                  )
-                }),
               ),
             ),
       )
@@ -2776,6 +2753,16 @@ window.__ModuleLoader__.load({
         }, 1600)
       }, [t, templateName])
 
+      // 谁正占着并发名额 —— 整屏共用一份，不拆到每个会话行里。
+      //
+      // 这一份回答的是「我现在等的那个模型是被谁占着」，所以它必须**跨会话**
+      // 合计：占着名额的很可能是别的会话，甚至是这一屏里根本没画出来的会话
+      // （被「外观」藏掉的子智能体）。拆到行上就答不了这个问题了。
+      //
+      // 空着不用的候选不进来：设了上限却没人用的模型可以有十几个，摊在这里
+      // 只会把真正在用的那几行淹掉。要看全量去设置页。
+      const inUse = Array.isArray(data?.limits) ? data.limits : []
+
       return div({ className: 'mf-qv' },
         div({ className: 'mf-qv-head' },
           div({ className: 'mf-title' }, t('viewQuarantine')),
@@ -2790,6 +2777,42 @@ window.__ModuleLoader__.load({
         div({ className: 'mf-note' }, t('qvHint')),
         error !== '' ? div({ className: 'mf-err' }, t('qvFailed', { message: error })) : null,
         actionError !== '' ? div({ className: 'mf-err' }, actionError) : null,
+        // 「并发占用」：全机器此刻被占着的那几格。整屏一份，放在会话列表**上面**
+        // —— 它说的是「现在谁在挡路」，那正是往下看这几行时要先知道的事。
+        //
+        // 只列**有人在用**的：设了上限却空着的候选可以有十几个，列出来只会把
+        // 真正在用的那几行淹掉。占着它的会话号写进悬停，不铺在行里 —— 会话号是
+        // 完整的 `session-<uuid>`，一行放两三个就把面板撑出横向滚动条。
+        inUse.length === 0
+          ? null
+          : div({ className: 'mf-qv-caps' },
+              span({ className: 'mf-qv-label' }, t('qvCapped')),
+              div({ className: 'mf-qv-list' },
+                ...inUse.map((item) => {
+                  const used = Number.isFinite(item.used) ? item.used : 0
+                  const cap = Number.isFinite(item.cap) ? item.cap : 0
+                  const full = cap > 0 && used >= cap
+                  const holders = Array.isArray(item.holders) ? item.holders : []
+                  const base = full
+                    ? t('qvCapFullHint', { used, cap })
+                    : t('qvCapHint', { used, cap })
+                  return span({
+                    className: full ? 'mf-qv-item mf-bad' : 'mf-qv-item',
+                    key: item.key,
+                    'data-role': 'qv-cap',
+                    title: holders.length === 0
+                      ? base
+                      : `${base}\n${t('qvCapHolders', { list: holders.map(fullId).join(', ') })}`,
+                  },
+                    sessionItemLabel(item),
+                    span({ className: 'mf-qv-code' }, ` · ${t('capLabel', { used, cap })}`),
+                    mineId !== '' && holders.includes(mineId)
+                      ? span({ className: 'mf-qv-code' }, ` · ${t('qvCapMine')}`)
+                      : null,
+                  )
+                }),
+              ),
+            ),
         data === null
           ? div({ className: 'mf-empty' }, t('qvLoading'))
           : rows.length === 0

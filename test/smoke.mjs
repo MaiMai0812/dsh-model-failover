@@ -2318,8 +2318,10 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(afterRecord.good.length, 0, '「已验证」这一条没了')
     assert.equal(afterRecord.quarantined.length, recorded.quarantined.length, '隔离那几条一条都不许被顺手删掉')
 
-    // ── 并发限制一栏只说「当前这个模型」 ────────────────────────────────────
-    // 两个候选都设了上限，但会话此刻只可能跑在其中一个上：那一栏必须只报它。
+    // ── 并发占用：跨会话的实时账，只列有人在用的 ────────────────────────────
+    // 两个候选都设了上限：alpha 跑了两个会话（上限 2，占满），beta 一个都没跑
+    // （上限 1，空着）。会话页那一栏要报的是「谁正占着名额」，所以只该出现
+    // alpha；空着的 beta 不进这份名单 —— 它一栏不占地方，但设置页那份全量里有它。
     const capped = await call('POST', '/api/dsh-model-failover/settings', {
       templates: [{
         id: 'default',
@@ -2338,39 +2340,35 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
       sessionId: 'sess-capped',
     })) { /* 把流跑完 */ }
     const cappedView = await call('GET', '/api/dsh-model-failover/sessions')
-    const cappedRow = cappedView.json.sessions.find((row) => row.sessionId === 'sess-capped')
-    assert.ok(cappedRow !== undefined, '跑过之后应出现这个会话')
-    assert.equal(cappedRow.capped.length, 1, `并发一栏只报当前模型，实际：${JSON.stringify(cappedRow.capped)}`)
-    assert.equal(cappedRow.capped[0].key, routeKey('alpha', 'one'), '报的就是它此刻在用的那个')
-    assert.equal(cappedRow.capped[0].cap, 2, '上限原样带出来')
-    // 换成 beta 在前、且 beta 能跑通：另一个会话（新会话，没有钉住的租约）从头
-    // 开始就会落在 beta 上，那一栏要跟着它换人，而不是一直报队首之外的 alpha。
-    scripts.set(routeKey('beta', 'one'), ok('换我跑'))
-    await call('POST', '/api/dsh-model-failover/settings', {
-      templates: [{
-        id: 'default',
-        name: '默认模板',
-        order: [
-          { provider: 'beta', model: 'one', concurrency: 1 },
-          { provider: 'alpha', model: 'one', concurrency: 2 },
-        ],
-      }],
-    })
+    const alphaKey = routeKey('alpha', 'one')
+    assert.equal(Array.isArray(cappedView.json.limits), true, '/sessions 要带上并发占用')
+    const inUse = cappedView.json.limits
+    assert.equal(inUse.length, 1, `只列有人在用的，实际：${JSON.stringify(inUse)}`)
+    assert.equal(inUse[0].key, alphaKey, '在用的就是它')
+    assert.equal(inUse[0].cap, 2, '上限原样带出来')
+    assert.equal(inUse[0].used, 1, '一个会话占着')
+    assert.deepEqual(inUse[0].holders, ['sess-capped'], '占着的是谁也要给出来')
+    assert.equal(cappedView.json.limits.some((row) => row.key === routeKey('beta', 'one')), false, '空着的候选不进这一份')
+
+    // 第二个会话也落在 alpha 上（新会话，队首就是它）：占用变 2/2，两个会话号都在。
     for await (const _ of registrations[0].adapter.stream({
       provider: ROUTE,
       model: 'auto',
-      messages: [{ role: 'user', content: [{ type: 'text', text: '换个模型' }] }],
-      sessionId: 'sess-capped-b',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '我也来' }] }],
+      sessionId: 'sess-capped-2',
     })) { /* 把流跑完 */ }
-    const movedView = await call('GET', '/api/dsh-model-failover/sessions')
-    const movedRow = movedView.json.sessions.find((row) => row.sessionId === 'sess-capped-b')
-    assert.equal(movedRow.capped.length, 1, '换人之后仍然只报一条')
-    assert.equal(movedRow.capped[0].key, routeKey('beta', 'one'), '跟着当前模型走，不是报固定的第一条')
-    // 原来那个会话仍然钉在 alpha 上（租约语义）：它那一栏也该照样报 alpha。
-    const stayedRow = movedView.json.sessions.find((row) => row.sessionId === 'sess-capped')
-    assert.equal(stayedRow.capped.length, 1, '老会话那一栏也只报一条')
-    assert.equal(stayedRow.capped[0].key, routeKey('alpha', 'one'), '它没换人，就不该跟着别人换')
-    // 设置页那份快照仍然是全量：它回答的是「这台机器上有哪些模型设了上限」。
+    const twoView = await call('GET', '/api/dsh-model-failover/sessions')
+    const two = twoView.json.limits.find((row) => row.key === alphaKey)
+    assert.ok(two !== undefined, '还有人占着就还在名单里')
+    assert.equal(two.used, 2, '两个会话各占一格')
+    assert.equal(two.used, two.cap, '正好占满')
+    assert.deepEqual([...two.holders].sort(), ['sess-capped', 'sess-capped-2'], '占着的两个会话号都在')
+
+    // 别的会话占着也算数：三条用例里每次都是**整屏一份**，不按行拆。
+    for (const row of twoView.json.sessions) {
+      assert.equal('capped' in row, false, `会话行上不该再挂并发字段，实际：${JSON.stringify(row.capped)}`)
+    }
+    // 设置页那份快照仍然是全量（含空着的）：它回答的是「这台机器上有哪些模型设了上限」。
     const fullView = await call('GET', '/api/dsh-model-failover/state')
     assert.equal(fullView.json.limits.length, 2, '设置页要看全部设了上限的模型，这条不能跟着收窄')
 
