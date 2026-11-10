@@ -1171,6 +1171,62 @@ await check('隔离队列：没人跑也没有上一趟时，那一行不挂「�
   assert.equal(skips.length, 0, '没有目标就不该摆一颗按了会报错的按钮')
 })
 
+await check('隔离队列：一轮跑完停下来之后，「正在用」那一格写「无」', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 宿主在收工之后就是这么发的：`active` 没了，行还在（它名下有隔离记录）。
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-done',
+      active: undefined,
+      quarantined: [
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId: 's-done', label: 'Code99 · Beta One' },
+      ],
+    }),
+  ])
+  let flat
+  let labels
+  let skips
+  try {
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-done', t })))
+    labels = fresh.nodes.filter((node) => node.props?.className === 'mf-qv-label').map((node) => node.text)
+    skips = skipButtons(fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.ok(labels.includes('正在用'), '「正在用」这一栏还在')
+  assert.ok(flat.includes('无'), `停下来之后那一格该写「无」，实际：${flat.slice(0, 400)}`)
+  assert.equal(flat.includes('Code99 · Beta One'), true, '隔离记录照旧列着')
+  assert.equal(skips.length, 0, '没有「正在用」的模型时也不该摆一颗跳过')
+  // 隔离那条挂在默认模板上，这个会话也在默认模板上 → 不必重复标模板名。
+  assert.equal(flat.includes('默认模板'), false, `同一条模板上的账不用补标模板名，实际：${flat.slice(0, 400)}`)
+})
+
+await check('隔离队列：收工之后，别的模板撞的墙照样补标模板名（模板 id 还在行上）', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 宿主在 `active` 消失之后仍会把会话挂的模板 id 挂在行上（`row.templateId`），
+  // 靠它决定隔离胶囊要不要写「这是哪条模板上的账」。
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-done',
+      active: undefined,
+      templateId: 'default',
+      quarantined: [
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId: 's-done', templateId: 'spare', label: 'Code99 · Beta One' },
+      ],
+    }),
+  ])
+  let flat
+  try {
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-done', t })))
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.ok(flat.includes('Code99 · Beta One'), '隔离记录在')
+  assert.ok(flat.includes('备用模板'), `别的模板上的账要标出模板名，实际：${flat.slice(0, 400)}`)
+})
+
 await check('隔离队列：已隔离和已验证的模型后面各跟一个蓝框写输出速度', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch

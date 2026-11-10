@@ -2982,6 +2982,142 @@ await check('宿主半身：本轮失败 / 输出撞上限时自动补发「继�
   }
 })
 
+// 15 · 一轮跑完停下来：正在用的模型改回「无」，并发名额还回去
+await check('宿主半身：一轮收工之后「正在用」改回无，占着的并发名额也还回去', async () => {
+  const freshHome = mkdtempSync(join(tmpdir(), 'model-failover-rest-'))
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = freshHome
+  try {
+    mkdirSync(join(freshHome, 'dsh-model-failover'), { recursive: true })
+    writeFileSync(join(freshHome, 'dsh-model-failover', 'settings.json'), JSON.stringify({
+      bootstrapped: true,
+      continueDelaySec: 0,
+      templates: [{
+        id: 'default',
+        name: '默认模板',
+        order: [
+          // beta 没有脚本 → NO_ADAPTER，会在这个会话名下留一条隔离记录。
+          // 留着它，收工之后这一行才不会整行消失，断言才有得看。
+          { provider: 'beta', model: 'one' },
+          { provider: 'alpha', model: 'one', concurrency: 2 },
+        ],
+      }],
+    }))
+
+    const llm = createLlm(new Map([[routeKey('alpha', 'one'), ok('好')]]))
+    llm.register('alpha', [{ id: 'one', name: 'Alpha One' }])
+    llm.register('beta', [{ id: 'one', name: 'Beta One' }])
+    let registered = null
+    llm.registerAdapter = (routes, adapter) => { registered = { routes, adapter }; return () => {} }
+    llm.registerConfigurableProviders = () => ({ replace: () => {}, dispose: () => {}, entries: [] })
+
+    const sent = []
+    const session = { id: 's-rest' }
+    const agent = {
+      status: 'idle',
+      inbox: { hasPending: false },
+      async whenIdle() {},
+      followup: (message) => sent.push(message),
+    }
+    const agents = { get: (id) => (id === 's-rest' ? agent : undefined) }
+
+    const listeners = new Map()
+    const scoped = (extra) => ({
+      ...extra,
+      effect: (fn) => { fn(); return () => {} },
+      on: (type, fn) => { listeners.set(type, fn); return () => listeners.delete(type) },
+    })
+
+    let handler
+    const ctx = {
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+      llm,
+      get: () => undefined,
+      fiber: { entry: { options: { id: 'model-failover' } } },
+      effect: (fn) => { fn(); return () => {} },
+      inject(names, callback) {
+        if (names.includes('webServer')) {
+          callback(scoped({ webServer: { register: (route) => { handler = route.handler; return () => {} } } }))
+        }
+        if (names.includes('agents')) callback(scoped({ agents }))
+      },
+    }
+
+    const mod = await import('../index.js')
+    mod.apply(ctx, {})
+    await new Promise((resolve) => setTimeout(resolve, 100))
+
+    const LOOPBACK = { host: '127.0.0.1:19387' }
+    const call = async (method, path) => {
+      const response = { status: 0, body: '', writeHead(status) { this.status = status }, end(payload) { this.body = payload ?? '' } }
+      await handler({ method, url: path, headers: LOOPBACK }, response)
+      return { status: response.status, json: JSON.parse(response.body) }
+    }
+    const fire = (type, data) => listeners.get('session/event')(session, { type, data })
+    const settle = () => new Promise((resolve) => setTimeout(resolve, 0))
+    /** 这个会话那一行（没有就是 undefined）。 */
+    const rowOf = async () => (await call('GET', '/api/dsh-model-failover/sessions')).json.sessions
+      .find((row) => row.sessionId === 's-rest')
+    /** alpha/one 在整屏并发那一栏里的那一条。 */
+    const capOf = async () => (await call('GET', '/api/dsh-model-failover/sessions')).json.limits
+      .find((item) => item.key === routeKey('alpha', 'one'))
+
+    // 跑真实的一轮：beta 撞 NO_ADAPTER 进隔离，alpha 接手把话说完。
+    fire('turn/start', { turn: 1 })
+    for await (const _ of registered.adapter.stream({
+      provider: ROUTE,
+      model: 'auto',
+      messages: [user('写点东西')],
+      sessionId: 's-rest',
+    })) { /* 把流跑完 */ }
+
+    const running = await rowOf()
+    assert.ok(running !== undefined, '跑过之后应有这个会话')
+    assert.equal(running.active.provider, 'alpha', '跑的时候「正在用」就是它')
+    assert.equal((await capOf()).used, 1, '跑的时候占着一格')
+    assert.equal((await capOf()).cap, 2)
+
+    // 这一轮撞了输出上限、还要补发「继续」：此刻**不能**还名额 —— 下一秒还要用它，
+    // 中间那一等被别人顶进来，一篇文档就会写到一半换人。
+    fire('turn/end', { turn: 1, reason: { kind: 'max-tokens' } })
+    await settle()
+    assert.equal(sent.length, 1, '这一轮该补发「继续」')
+    assert.equal((await capOf()).used, 1, '还要接着跑的时候，名额得留着')
+    assert.equal((await rowOf()).active.provider, 'alpha', '「正在用」这时候也还是它')
+
+    // 补发出来的那一轮正常跑完、停下来：模型改回无，名额还回去。
+    fire('turn/start', { turn: 2 })
+    for await (const _ of registered.adapter.stream({
+      provider: ROUTE,
+      model: 'auto',
+      messages: [user('继续')],
+      sessionId: 's-rest',
+    })) { /* 把流跑完 */ }
+    fire('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    await settle()
+
+    const rested = await rowOf()
+    assert.ok(rested !== undefined, '隔离记录还在，这一行不该整行消失')
+    assert.equal(rested.active, undefined, '停下来之后「正在用」要改回无')
+    assert.equal(rested.templateId, 'default', '但「这个会话挂在哪条模板上」还得留着：隔离胶囊靠它决定要不要补标模板名')
+    assert.equal(rested.quarantined.length, 1, '收工不该把隔离名单一起清掉')
+
+    const freed = await capOf()
+    assert.equal(freed.used, 0, '名额要还回去，否则别人只看到空位却轮不到')
+    assert.ok(freed.coolingMs > 0, '刚收工先歇一会儿（默认 5 秒），别立刻塞下一个请求')
+
+    // 还回来的那一格真的能给别人用：同一个候选、另一个会话，立刻拿得到。
+    const other = await call('GET', '/api/dsh-model-failover/state')
+    assert.equal(other.status, 200)
+    const stillCapped = other.json.limits.find((item) => item.key === routeKey('alpha', 'one'))
+    assert.equal(stillCapped.used, 0, '设置页那份全量里同样是 0')
+    assert.equal(stillCapped.cap, 2, '上限本身不该被这次收工改写')
+  } finally {
+    process.env.DSH_HOME = previous
+    rmSync(freshHome, { recursive: true, force: true })
+  }
+})
+
 rmSync(HOME, { recursive: true, force: true })
 
 console.log(`\n${passed} 通过 / ${failed} 失败`)

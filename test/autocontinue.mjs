@@ -56,8 +56,9 @@ const settingsOf = (overrides = {}) => ({ ...DEFAULT_SETTINGS, ...overrides })
  * @param {number} [options.pendingTtlMs] - 覆盖标记有效期。
  * @param {(ms: number) => Promise<void>} [options.sleep] - 覆盖等待实现。
  * @param {any} [options.notes] - 轮尾便签收集器（TurnNotes）；不传就不记。
+ * @param {(sessionId: string) => void} [options.onRest] - 收工回调；不传就记进 `rests`。
  */
-function makeHarness({ settings = settingsOf(), status = 'idle', hasPending = false, now, pendingTtlMs, sleep, notes } = {}) {
+function makeHarness({ settings = settingsOf(), status = 'idle', hasPending = false, now, pendingTtlMs, sleep, notes, onRest } = {}) {
   const session = { id: 's1' }
   const sent = []
   const agent = {
@@ -72,6 +73,8 @@ function makeHarness({ settings = settingsOf(), status = 'idle', hasPending = fa
   }
   const events = []
   const warnings = []
+  /** 每调一次「收工」就记一条会话号 —— 宿主那边拿它去还并发名额。 */
+  const rests = []
   // 真的等 5 秒会让整套测试慢得没法跑；记下每次等待的时长，立刻返回。
   const waits = []
   const auto = new AutoContinue({
@@ -81,12 +84,13 @@ function makeHarness({ settings = settingsOf(), status = 'idle', hasPending = fa
     ...(now === undefined ? {} : { now }),
     ...(pendingTtlMs === undefined ? {} : { pendingTtlMs }),
     ...(notes === undefined ? {} : { notes }),
+    onRest: onRest ?? ((sessionId) => rests.push(sessionId)),
     sleep: sleep ?? (async (ms) => { waits.push(ms) }),
   })
   const end = (reason, turn = 1) => ({ type: 'turn/end', data: { turn, reason } })
   /** 驱动开始跑一轮 —— 我们的 followup 和用户手敲的消息都会产生它。 */
   const start = (turn = 1) => ({ type: 'turn/start', data: { turn } })
-  return { session, agent, agents, sent, events, warnings, auto, end, start, settings, waits }
+  return { session, agent, agents, sent, events, warnings, auto, end, start, settings, waits, rests }
 }
 
 // ── 触发判定（纯函数） ──────────────────────────────────────────────────────
@@ -712,6 +716,139 @@ await check('没有便签收集器时不该炸（宿主可以不给）', async (
   await settle()
   assert.equal(h.sent.length, 1, '没便签也该照常补发')
   assert.equal(h.warnings.length, 0)
+})
+
+// ── 收工清理 ────────────────────────────────────────────────────────────────
+// 「这一轮真的停了」= 把「正在用哪个模型」清掉 + 把并发名额还回去。三个落点：
+// 正常收尾、不再补发的报错、补发次数用满。唯一不还的是「还要接着补发」那条路。
+
+process.stdout.write('autocontinue: 收工清理\n')
+
+await check('便签：收工之后不再报「正在用哪个模型」，但模板还留着', () => {
+  const notes = new TurnNotes()
+  notes.remember('s1', { provider: 'alpha', model: 'one', template: 'spare', at: 3 })
+  assert.equal(notes.latest('s1').provider, 'alpha')
+
+  notes.rest('s1')
+  assert.equal(notes.latest('s1'), undefined, '模型已经不算「在用」了')
+  assert.equal(notes.templateOf('s1'), 'spare', '模板要留着：界面拿它标「哪条模板上的账」')
+})
+
+await check('便签：没收工过的会话，取模板拿不到东西', () => {
+  const notes = new TurnNotes()
+  assert.equal(notes.latest('s2'), undefined)
+  assert.equal(notes.templateOf('s2'), undefined)
+  // 收一个从没记过的会话也不该炸。
+  notes.rest('s2')
+  assert.equal(notes.templateOf('s2'), undefined)
+})
+
+await check('便签：收工只影响这一个会话', () => {
+  const notes = new TurnNotes()
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  notes.remember('s2', { provider: 'beta', model: 'two', at: 2 })
+  notes.rest('s1')
+  assert.equal(notes.latest('s1'), undefined)
+  assert.equal(notes.latest('s2').provider, 'beta')
+})
+
+await check('收工清理：正常跑完一轮就清掉「正在用」、并通知宿主还名额', () => {
+  const notes = new TurnNotes()
+  const h = makeHarness({ notes })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  h.auto.observe(h.session, h.end({ kind: 'completed' }, 1))
+
+  assert.deepEqual(h.rests, ['s1'], '宿主该收到一次收工通知')
+  assert.equal(notes.latest('s1'), undefined, '收工之后没人在用那个模型')
+  assert.equal(h.sent.length, 0, '跑完了就不用补发')
+})
+
+await check('收工清理：还要补发「继续」的时候不许还名额（下一秒还要接着用）', async () => {
+  const notes = new TurnNotes()
+  const h = makeHarness({ notes })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  h.auto.observe(h.session, h.end({ kind: 'max-tokens' }, 1))
+  await settle()
+
+  assert.equal(h.sent.length, 1, '这一轮确实要补发')
+  assert.deepEqual(h.rests, [], '中间那一等里名额还要留着，否则会被别的会话顶走')
+  assert.equal(notes.latest('s1').provider, 'alpha', '「正在用」这时也确实还是它')
+})
+
+await check('收工清理：报错且不补发（本机网络问题）时也要还', () => {
+  const notes = new TurnNotes()
+  const h = makeHarness({ notes })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  h.auto.observe(h.session, h.end({ kind: 'error', error: { code: 'TRANSPORT', message: 'fetch failed' } }, 1))
+
+  assert.equal(h.sent.length, 0, '本机网络问题不补发')
+  assert.deepEqual(h.rests, ['s1'], '这一轮到此为止，名额得还')
+  assert.equal(notes.latest('s1'), undefined)
+})
+
+await check('收工清理：补发次数用满时也要还', async () => {
+  const notes = new TurnNotes()
+  const h = makeHarness({ notes, settings: settingsOf({ autoContinueMaxTokensLimit: 1 }) })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  h.auto.observe(h.session, h.end({ kind: 'max-tokens' }, 1))
+  await settle()
+  assert.equal(h.sent.length, 1, '第一次照补')
+  assert.deepEqual(h.rests, [], '补发这一下不算收工')
+
+  // 第二轮又撞上限，但这一次额度用完了。
+  h.auto.observe(h.session, h.start(2))
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 2 })
+  h.auto.observe(h.session, h.end({ kind: 'max-tokens' }, 2))
+  await settle()
+
+  assert.equal(h.sent.length, 1, '不许再补第三次')
+  assert.deepEqual(h.rests, ['s1'], '用满 = 这一轮结束，名额该还了')
+  assert.equal(notes.latest('s1'), undefined)
+})
+
+await check('收工清理：把开关关掉时，那一轮也照常还名额', async () => {
+  const notes = new TurnNotes()
+  const h = makeHarness({ notes, settings: settingsOf({ autoContinue: false }) })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  h.auto.observe(h.session, h.end({ kind: 'max-tokens' }, 1))
+  await settle()
+
+  assert.equal(h.sent.length, 0)
+  assert.deepEqual(h.rests, ['s1'])
+  assert.equal(notes.latest('s1'), undefined)
+})
+
+await check('收工清理：清理里抛错不会把 turn/end 的处理带崩', () => {
+  const notes = new TurnNotes()
+  const h = makeHarness({ notes, onRest: () => { throw new Error('名额账本已经关了') } })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  h.auto.observe(h.session, h.end({ kind: 'completed' }, 1))
+
+  assert.ok(
+    h.warnings.some((w) => w.includes('名额账本已经关了')),
+    `要留一条警告，实际：${JSON.stringify(h.warnings)}`,
+  )
+  // 便签这一半已经做完了：报错的是宿主那一半。
+  assert.equal(notes.latest('s1'), undefined)
+})
+
+await check('收工清理：宿主不接这条线时，便签照样清（onRest 是可选的）', () => {
+  const notes = new TurnNotes()
+  const session = { id: 's1' }
+  const warnings = []
+  // 刻意不给 `onRest`：老宿主 / 单独跑 autocontinue 时就是这样。
+  const auto = new AutoContinue({
+    agents: { get: (id) => (id === 's1' ? { status: 'idle', inbox: { hasPending: false }, async whenIdle() {}, followup() {} } : undefined) },
+    settings: { get: () => settingsOf() },
+    log: { warn: (m) => warnings.push(m) },
+    notes,
+    sleep: async () => {},
+  })
+  notes.remember('s1', { provider: 'alpha', model: 'one', at: 1 })
+  auto.observe(session, { type: 'turn/end', data: { turn: 1, reason: { kind: 'completed' } } })
+
+  assert.equal(notes.latest('s1'), undefined, '便签这一半不依赖宿主')
+  assert.deepEqual(warnings, [], '缺一个可选回调不该报错')
 })
 
 // ── 设置归一 ────────────────────────────────────────────────────────────────

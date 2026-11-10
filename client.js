@@ -2398,6 +2398,14 @@ window.__ModuleLoader__.load({
       const runningTemplate = typeof row?.running?.templateName === 'string' && row.running.templateName !== ''
         ? row.running.templateName
         : undefined
+      /**
+       * 这个会话这一轮挂在哪条模板上（收工之后 `active` 没了，模板还在）。
+       *
+       * 只用来决定隔离胶囊要不要补标模板名：同一条模板上的账不必重复说。
+       */
+      const sessionTemplateId = typeof row?.templateId === 'string' && row.templateId !== ''
+        ? row.templateId
+        : active?.templateId
       // 每个模型胶囊后面跟一个蓝色小框写它的输出速度 —— 已隔离和已验证都要，
       // 因为「它多快」和「它今天行不行」是两个独立的问题：一个被隔离的模型
       // 可能刚才还跑得飞快（只是最后撞了额度），而那正是值得知道的信息。
@@ -2547,7 +2555,7 @@ window.__ModuleLoader__.load({
                     span(null, sessionItemLabel(item)),
                     // 别的模板撞的墙不算这个会话当前的麻烦，但也不能凭空消失：
                     // 补一句模板名，说明它是哪条队列上的账。
-                    item.templateId === undefined || item.templateId === active?.templateId
+                    item.templateId === undefined || item.templateId === sessionTemplateId
                       ? null
                       : span({ className: 'mf-qv-code' }, ` · ${templateName(item.templateId)}`),
                     span({ className: 'mf-qv-code' }, ` · ${codeText(item.code) || String(item.code ?? '?')} · ${stamp(item.at)}`),

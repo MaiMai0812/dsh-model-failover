@@ -618,7 +618,25 @@ export function apply(ctx, _config) {
       row.good = group.good.map(decorate)
     }
     for (const [sessionId, hit] of notes.entries()) {
-      rowOf(sessionId).active = {
+      const templateId = typeof hit.template === 'string' && hit.template !== '' ? hit.template : undefined
+      // 收工之后便签里只剩模板（`lib/notes.js` 的 `rest()`）：那不是「正在用哪个
+      // 模型」。这一步就是「跑完一轮停下来 → 那一格改回无」的落点，前端拿到
+      // `active === undefined` 会画 `t('none')`。
+      //
+      // 刻意**先判断再 `rowOf()`**：反过来的话，一个已经收工、手上又没有隔离或
+      // 已验证记录的会话会凭空多出一行「正在用 无 / 没出问题」，那是噪音。
+      // 真有记录的那些会话，行早就由上面那段建好了，同样显示「无」。
+      if (typeof hit.provider !== 'string' || typeof hit.model !== 'string') {
+        // 但「这个会话挂在哪条模板上」还得知道：隔离胶囊靠它决定要不要补标模板
+        // 名（同一条模板上的账不用重复说）。行已经存在时顺手补上，没有就算了 ——
+        // 没有行就没有胶囊要标。
+        const existing = table.get(sessionId)
+        if (existing !== undefined && templateId !== undefined) existing.templateId = templateId
+        continue
+      }
+      const row = rowOf(sessionId)
+      if (templateId !== undefined) row.templateId = templateId
+      row.active = {
         provider: hit.provider,
         model: hit.model,
         at: hit.at,
@@ -1024,6 +1042,19 @@ export function apply(ctx, _config) {
       agents: scoped.agents,
       settings: settingsFile,
       notes,
+      // 一轮收工、真的停下来了：把「正在用哪个模型」清掉，并把并发名额还回去。
+      //
+      // 交还走 `cool: true`（默认）：这一格刚被用满过，上游那边的配额核算比本地
+      // 慢半拍 —— 会话这边一收工就立刻让别人顶进去，很容易撞出个跟模型质量无关
+      // 的 429，然后那个模型被隔离一整天。冷却只是几秒的事（`limitCooldownSec`，
+      // 默认 5 秒，设 0 就是不歇）。
+      //
+      // 不传 `cooldowns`：这里说的是**并发名额**，跟「这个模型被限流了、先别用它」
+      // 是两本账，混在一起会把一个好好的模型从队列里摘掉几十秒。
+      onRest: (sessionId) => {
+        const freed = limits.freeSession(sessionId)
+        if (freed > 0) logger.info?.(`model-failover: 本轮收工，已交还这个会话占着的 ${freed} 个并发名额`)
+      },
       log: {
         info: (message) => logger.info?.(`model-failover: ${message}`),
         warn: (message) => logger.warn?.(`model-failover: ${message}`),
