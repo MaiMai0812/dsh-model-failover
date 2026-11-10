@@ -719,6 +719,11 @@ const forgetButtons = (runtime) => runtime.nodes.filter(
   (node) => node.tag === 'button' && String(node.props?.className ?? '').includes('mf-qv-x'),
 )
 
+/** 「正在用」那一行右边那颗「跳过」，按渲染顺序。 */
+const skipButtons = (runtime) => runtime.nodes.filter(
+  (node) => node.tag === 'button' && String(node.props?.className ?? '').includes('mf-qv-skip'),
+)
+
 await check('隔离队列：注册成 conversation.view，排在 chat 与详情右边，标题走字典', () => {
   const definition = sections[2].definition
   assert.equal(definition.name, 'conversation.view')
@@ -1040,6 +1045,130 @@ await check('隔离队列：划记录失败时如实报错，不假装删掉了'
   // 别把它说成「读取失败」——那会让人以为只是没刷新。
   assert.equal(flat.includes('读取失败'), false, '写失败不该借用读取失败的文案')
   assert.ok(flat.includes('Code99 · Beta One'), '没删成就得原样留着')
+})
+
+await check('隔离队列：正在用的那个模型后面挂一颗「跳过」，旁边那颗叉叉是删名单的', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-mine',
+      quarantined: [
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'QUOTA', message: '余额不足', at, sessionId: 's-mine', templateId: 'default', label: 'Code99 · Beta One' },
+      ],
+    }),
+  ])
+  let skips
+  let xs
+  let flat
+  try {
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-mine', t })))
+    skips = skipButtons(fresh)
+    xs = forgetButtons(fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(skips.length, 1, '一行只有一颗跳过（挂在「当前」那一行）')
+  assert.equal(skips[0].text, '跳过')
+  assert.equal(skips[0].props['data-role'], 'qv-skip')
+  assert.equal(typeof skips[0].props.onClick, 'function', '点得动')
+  // 悬停要说清「跳过」跟「停止」不是一回事：这一轮照样做完，只是换个人。
+  assert.ok(String(skips[0].props.title).includes('接力'), `提示要讲清接力，实际：${skips[0].props.title}`)
+  assert.equal(xs.length, 1, '叉叉还在，两者是不同动作，别混成一个')
+  assert.ok(flat.includes('硅基流动 · Alpha One'))
+})
+
+await check('隔离队列：点「跳过」把当前那个模型交给宿主隔离，请求带它自己的 key', async () => {
+  const fresh = new Runtime()
+  const asked = []
+  const saved = globalThis.fetch
+  // 宿主那边跳过一次之后，这个名字再查 /sessions 就挂在隔离名单上了。
+  const skippedRow = () => sessionRow({
+    sessionId: 's-mine',
+    active: { provider: 'alpha', model: 'one', at, label: '硅基流动 · Alpha One', templateId: 'default', templateName: '默认模板' },
+    quarantined: [{ key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'MANUAL_SKIP', message: '用户点了跳过', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' }],
+  })
+  let skipped = false
+  globalThis.fetch = async (url, options) => {
+    const target = String(url)
+    asked.push({ url: target, method: options?.method ?? 'GET', body: options?.body })
+    if ((options?.method ?? 'GET') === 'POST') {
+      skipped = true
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          ok: true,
+          key: KEY('alpha', 'one'),
+          provider: 'alpha',
+          model: 'one',
+          live: true,
+          sessions: [skippedRow()],
+          now: at,
+          day: '2026-11-27',
+          route: { provider: 'model-failover', label: '模型接力' },
+          templates: [{ id: 'default', name: '默认模板' }],
+          view: { subagentSessions: false, foreignSessions: true },
+        }),
+      }
+    }
+    return sessionsPayload([skipped ? skippedRow() : sessionRow({ sessionId: 's-mine' })])
+  }
+  let after
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    await skipButtons(fresh)[0].props.onClick()
+    after = fresh.text(await fresh.mount(queue({ sessionId: 's-mine', t })))
+  } finally {
+    globalThis.fetch = saved
+  }
+  const posted = asked.filter((row) => row.method === 'POST')
+  assert.equal(posted.length >= 1, true, '点下去要真的发请求')
+  assert.ok(posted[0].url.includes('/api/dsh-model-failover/skip'), `要打 /skip，实际：${posted[0].url}`)
+  assert.deepEqual(JSON.parse(posted[0].body), {
+    sessionId: 's-mine',
+    templateId: 'default',
+    key: KEY('alpha', 'one'),
+  }, '三项都要带齐：会话号、模板、点名的那个模型')
+  assert.ok(after.includes('手动跳过'), `隔离条要给「手动跳过」这个码的人话，实际：${after.slice(0, 400)}`)
+})
+
+await check('隔离队列：跳过失败时如实报错，不假装换人了', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if ((options?.method ?? 'GET') === 'POST') {
+      return { ok: false, status: 400, text: async () => JSON.stringify({ ok: false, error: '要跳过哪一个？既没给 key，也没有正在跑的模型' }) }
+    }
+    return sessionsPayload([sessionRow({ sessionId: 's-mine' })])
+  }
+  let flat
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    await skipButtons(fresh)[0].props.onClick()
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-mine', t })))
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.ok(flat.includes('没跳过'), `要有「没跳过」的开头，实际：${flat.slice(0, 400)}`)
+  assert.ok(flat.includes('没有正在跑的模型'), '宿主那句话要原样带出来')
+  assert.equal(flat.includes('读取失败'), false, '不是读取失败，别借那句文案')
+})
+
+await check('隔离队列：没人跑也没有上一趟时，那一行不挂「跳过」（点了也不知道跳谁）', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({ sessionId: 's-mine', active: undefined }),
+  ])
+  let skips
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    skips = skipButtons(fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(skips.length, 0, '没有目标就不该摆一颗按了会报错的按钮')
 })
 
 await check('隔离队列：已隔离和已验证的模型后面各跟一个蓝框写输出速度', async () => {

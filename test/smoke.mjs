@@ -1000,6 +1000,105 @@ await check('卡住超时设 0 = 不管：愿意等多久就等多久', async ()
   assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0)
 })
 
+// 8.6 · 手动跳过：用户不等它自己超时，先把人换掉
+await check('手动跳过：上游一个字都不吐时按下去，这一趟立刻让位给下一个', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    // 卡住超时给足 60 秒：这条用例要证的是「跳过比超时快」，不能让超时替它干活。
+    settings: { idleTimeoutSec: 60, sameModelRetries: 0 },
+    scripts: new Map([
+      [routeKey('alpha', 'one'), () => (async function* () {
+        // 永远不吐：模拟连接活着但上游在生产队列里排着。
+        await new Promise(() => {})
+      })()],
+      [routeKey('beta', 'one'), ok('换我接着写')],
+    ]),
+  })
+
+  const startedAt = Date.now()
+  const running = drain(h.adapter.stream({
+    provider: ROUTE,
+    model: 'default',
+    messages: [user('写')],
+    sessionId: 'sess-skip',
+  }))
+  // 等这一趟真的挂到 alpha 上（`live` 有记录），再按跳过。
+  await new Promise((resolve) => { setTimeout(resolve, 50) })
+  assert.equal(h.adapter.liveFor('sess-skip')?.key, routeKey('alpha', 'one'), '按之前应当是 alpha 在跑')
+  const outcome = h.adapter.skip({ sessionId: 'sess-skip', key: routeKey('alpha', 'one') })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.live, true, '它确实正在跑，要如实报')
+  assert.equal(outcome.provider, 'alpha')
+
+  const chunks = await running
+  const elapsed = Date.now() - startedAt
+  assert.equal(textOf(chunks), '换我接着写', '接力应当换到下一个模型上接着做完')
+  assert.ok(elapsed < 5_000, `跳过要立刻生效，不该等到超时，实际 ${elapsed}ms`)
+  assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one'), routeKey('beta', 'one')])
+
+  const rows = h.health.view(h.clock.ms, 1).quarantined
+  assert.equal(rows.length, 1, '被跳过的那一个要进隔离名单')
+  assert.equal(rows[0].code, 'MANUAL_SKIP', '码要说清是「用户说的」，别冒充上游报错')
+  assert.equal(rows[0].message, '用户点了跳过')
+  assert.ok(h.events.some((event) => event.kind === 'skip' && event.key === routeKey('alpha', 'one')),
+    `事件日志里要有一笔：${JSON.stringify(h.events)}`)
+})
+
+await check('手动跳过：不传 key 就跳「此刻正在跑的那个」', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    settings: { idleTimeoutSec: 60, sameModelRetries: 0 },
+    scripts: new Map([
+      [routeKey('alpha', 'one'), () => (async function* () { await new Promise(() => {}) })()],
+      [routeKey('beta', 'one'), ok('来了')],
+    ]),
+  })
+  const running = drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('写')], sessionId: 'sess-auto',
+  }))
+  await new Promise((resolve) => { setTimeout(resolve, 50) })
+  const outcome = h.adapter.skip({ sessionId: 'sess-auto' })
+  assert.equal(outcome.ok, true, '没给 key 时应当拿实时表里那个')
+  assert.equal(outcome.key, routeKey('alpha', 'one'))
+  const chunks = await running
+  assert.equal(textOf(chunks), '来了')
+})
+
+await check('手动跳过：没在跑、也没给 key 时如实说没跳成', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }],
+    scripts: new Map([[routeKey('alpha', 'one'), ok('好')]]),
+  })
+  const idle = h.adapter.skip({ sessionId: 'sess-nobody' })
+  assert.deepEqual(idle, { ok: false }, '没有目标就不该假装做了点什么')
+})
+
+await check('手动跳过：跳过之后这一趟不再用它，下一次调用也从下一个开始', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    settings: { idleTimeoutSec: 60, sameModelRetries: 0 },
+    scripts: new Map([
+      [routeKey('alpha', 'one'), ok('我先')],
+      [routeKey('beta', 'one'), ok('我后')],
+    ]),
+  })
+  // 先正常跑一趟，让它记住 alpha 好用。
+  const first = await drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('一')], sessionId: 'sess-next',
+  }))
+  assert.equal(textOf(first), '我先')
+  // 用户看着它不满意（慢、或者答得不对），在没跑的时候也能点名跳过：
+  // 前端那颗按钮点的就是「这一行显示的那个模型」。
+  const outcome = h.adapter.skip({ sessionId: 'sess-next', key: routeKey('alpha', 'one') })
+  assert.equal(outcome.ok, true)
+  assert.equal(outcome.live, false, '没在跑，如实报 false')
+  const second = await drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('二')], sessionId: 'sess-next',
+  }))
+  assert.equal(textOf(second), '我后', '隔离了就不该再排到队首')
+  assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one'), routeKey('beta', 'one')])
+})
+
 // 9 · 补发节奏：每次换人带「继续」之前先等一等
 await check('补发节奏：每次「继续」之前都先等一等，首次请求不等', async () => {
   const h = await harness({
@@ -2317,6 +2416,56 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     const afterRecord = keepQuarantine.json.sessions.find((row) => row.sessionId === 'sess-record')
     assert.equal(afterRecord.good.length, 0, '「已验证」这一条没了')
     assert.equal(afterRecord.quarantined.length, recorded.quarantined.length, '隔离那几条一条都不许被顺手删掉')
+
+    // ── 跳过：会话页「正在用」那一行右边那颗按钮 ────────────────────────────
+    // 它是 `/forget-record` 的反动作：那个从名单上删一条，这个往名单上加一条，
+    // 并且把那个模型从这一轮的接力里摘出去。
+    const skipNothing = await call('POST', '/api/dsh-model-failover/skip', {})
+    assert.equal(skipNothing.status, 400, '既没给 key 也没人在跑，必须拒绝')
+    assert.equal(skipNothing.json.ok, false)
+    assert.match(skipNothing.json.error, /key/)
+
+    // 点名跳过一个（此刻没在跑）：写进这个会话的隔离名单，码必须是手动的那个。
+    const skipped = await call('POST', '/api/dsh-model-failover/skip', {
+      sessionId: 'sess-skip', templateId: 'default', key: routeKey('alpha', 'one'),
+    })
+    assert.equal(skipped.status, 200)
+    assert.equal(skipped.json.ok, true)
+    assert.equal(skipped.json.key, routeKey('alpha', 'one'))
+    assert.equal(skipped.json.provider, 'alpha')
+    assert.equal(skipped.json.live, false, '没在跑就如实说 false')
+    const skipRow = skipped.json.sessions.find((row) => row.sessionId === 'sess-skip')
+    assert.ok(skipRow !== undefined, '响应里要带回新的会话列表')
+    const recordedSkip = skipRow.quarantined.find((item) => item.key === routeKey('alpha', 'one'))
+    assert.ok(recordedSkip !== undefined, `跳过的那个要进隔离名单：${JSON.stringify(skipRow)}`)
+    assert.equal(recordedSkip.code, 'MANUAL_SKIP', '别冒充上游报错，得说清是用户点的')
+
+    // 真的进了队尾：这个会话下一趟应当从 beta 开始（alpha 被隔离了）。
+    const callsBeforeSkip = llm.calls.length
+    for await (const _ of registrations[0].adapter.stream({
+      provider: ROUTE,
+      model: 'default',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '接着做' }] }],
+      sessionId: 'sess-skip',
+    })) { /* 把流跑完 */ }
+    // 那个会话这一趟只会打到 beta：alpha 被隔离了，一次都不该再请求。
+    // （beta 可能被重发几次 —— 同模型重试次数是设置里的，与这里无关。）
+    const skippedCalls = llm.calls.slice(callsBeforeSkip).map((row) => row.key)
+    assert.equal(skippedCalls.includes(routeKey('alpha', 'one')), false,
+      `被跳过的那个不该再被请求，实际：${JSON.stringify(skippedCalls)}`)
+    assert.equal(skippedCalls.every((key) => key === routeKey('beta', 'one')), true,
+      `这一趟只该落在 beta 上，实际：${JSON.stringify(skippedCalls)}`)
+
+    // 事件日志也要留一笔，界面上那句「你跳过了…」就是从这里来的。
+    const afterSkip = await call('GET', '/api/dsh-model-failover/state')
+    const skipEvent = afterSkip.json.events.find((event) => event.kind === 'skip')
+    assert.ok(skipEvent !== undefined, `事件日志里要有一笔 skip：${JSON.stringify(afterSkip.json.events)}`)
+    assert.equal(skipEvent.provider, 'alpha')
+    assert.equal(skipEvent.model, 'one')
+    assert.equal(skipEvent.live, false)
+
+    // 收摊：把这一条撤销，免得影响后面「并发限制」那几条对占用数的断言。
+    await call('POST', '/api/dsh-model-failover/reset?sessionId=sess-skip', {})
 
     // ── 并发限制：跨会话的实时账，含此刻空着的候选 ──────────────────────────
     // 两个候选都设了上限：alpha 跑了两个会话（上限 2，占满），beta 一个都没跑

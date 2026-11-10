@@ -158,6 +158,10 @@ window.__ModuleLoader__.load({
 .mf-qv-title { flex: 1; min-width: 0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .mf-qv-id { flex: none; opacity: .45; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; user-select: all; }
 .mf-qv-clear { flex: none; font-size: 11.5px; padding: 1px 8px; }
+/* 「跳过」比「解除隔离」按得勤，给它一点存在感；但不用实心主色 —— 它会改变
+   接力路线，太显眼容易被误点。悬停才染红，跟「出问题」的语义对上。 */
+.mf-qv-skip { flex: none; font-size: 11.5px; padding: 1px 8px; }
+.mf-qv-skip:hover:not(:disabled) { color: #e5484d; border-color: color-mix(in srgb, #e5484d 45%, transparent); }
 .mf-qv-line { display: flex; align-items: baseline; gap: 8px; }
 /* 「并发占用」一整块：它不属于任何一个会话，所以单独一块，跟下面那些会话卡拉开。 */
 .mf-qv-caps { display: flex; align-items: baseline; gap: 8px; padding: 8px 12px; border-radius: 10px; border: 1px dashed color-mix(in srgb, currentColor 18%, transparent); }
@@ -329,6 +333,8 @@ window.__ModuleLoader__.load({
         trigError: '运行失败',
         evAutoContinueSkipped: '本轮是本机网络问题（{code}），没有补发「继续」',
         evCeilingRotate: '「{provider} · {model}」连着 {count} 次撞到输出上限，接着写的换成「{to}」',
+        evSkip: '你跳过了「{provider} · {model}」，它今天不再进队',
+        evSkipLive: '你跳过了「{provider} · {model}」，正在跑的这一趟已让位，接力接着往下走',
         count: '条',
         events: '事件日志',
         clearLog: '清空日志',
@@ -375,6 +381,9 @@ window.__ModuleLoader__.load({
         qvForgetQuarantineHint: '把这个模型今天的隔离撤掉，只撤这一条 —— 下一次它就能重新进队。别的模型、别的会话一条都不动。',
         qvForgetGoodHint: '把这个模型从「已验证」名单上划掉，只划这一条 —— 它仍然可用，只是不再预先把这一趟算作靠谱。别的记录一条都不动。',
         qvForgetFailed: '没删掉：{message}',
+        qvSkip: '跳过',
+        qvSkipHint: '跳过 {label}：把它记进今天的隔离名单，接力接着用下一个模型做完这一轮。已经吐出来的内容不丢。',
+        qvSkipFailed: '没跳过：{message}',
         qvLoading: '读取中…',
         qvFailed: '读取失败：{message}',
         qvEmpty: '还没有任何会话跑过。',
@@ -535,6 +544,8 @@ window.__ModuleLoader__.load({
         trigError: 'failed',
         evAutoContinueSkipped: 'Local network problem ({code}) — no “continue” was sent',
         evCeilingRotate: '“{provider} · {model}” hit the output ceiling {count} times in a row — “{to}” takes over',
+        evSkip: 'You skipped “{provider} · {model}” — it is out for today',
+        evSkipLive: 'You skipped “{provider} · {model}” — the running attempt stepped aside and the queue carries on',
         count: 'entries',
         events: 'Event log',
         clearLog: 'Clear log',
@@ -581,6 +592,9 @@ window.__ModuleLoader__.load({
         qvForgetQuarantineHint: 'Lift this model’s quarantine — this entry only. It becomes eligible again on the next run; no other model or conversation is touched.',
         qvForgetGoodHint: 'Drop this model from “Verified” — this entry only. It stays usable; it just stops counting as a safe bet up front.',
         qvForgetFailed: 'Not removed: {message}',
+        qvSkip: 'Skip',
+        qvSkipHint: 'Skip {label}: quarantine it for today and let the queue finish this turn on the next model. Nothing already streamed is lost.',
+        qvSkipFailed: 'Could not skip: {message}',
         qvLoading: 'Loading…',
         qvFailed: 'Could not load: {message}',
         qvEmpty: 'No conversation has run anything yet.',
@@ -797,6 +811,7 @@ window.__ModuleLoader__.load({
         SERVER: '服务端错误',
         TIMEOUT: '超时',
         IDLE_TIMEOUT: '卡住不动了',
+        MANUAL_SKIP: '手动跳过',
         TRANSPORT: '网络中断',
         CONTEXT_WINDOW_EXCEEDED: '上下文超长',
         ABORTED: '被中止',
@@ -1446,6 +1461,14 @@ window.__ModuleLoader__.load({
             break
           case 'auto-continue-skipped':
             body = t('evAutoContinueSkipped', { code: event.code ?? '?' })
+            break
+          case 'skip':
+            // 用户自己在会话页按的那颗「跳过」。它和「隔离」是同一笔账、不同的
+            // 起因，所以事件里得说清楚是**人**说的，不是上游报的错。
+            body = t(event.live === true ? 'evSkipLive' : 'evSkip', {
+              provider: event.provider,
+              model: event.model,
+            })
             break
           case 'ceiling-rotate':
             body = t('evCeilingRotate', {
@@ -2364,7 +2387,7 @@ window.__ModuleLoader__.load({
      * 拿不到时退回会话号前缀 —— 这一栏是给人看「哪个会话出事了」，标题只是
      * 帮助识别，缺了也不能空白。
      */
-    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, busy, onCopyError, copiedKey, nowMs }) {
+    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, onSkip, busy, onCopyError, copiedKey, nowMs }) {
       const quarantined = row?.quarantined ?? []
       const good = row?.good ?? []
       const active = row?.active
@@ -2477,6 +2500,29 @@ window.__ModuleLoader__.load({
           // 「当前」这一行也要有时间：正在跑的那一个只在实时表里，未必同时出现在
           // 下面「已验证」的名单里 —— 漏了这里，用户就看不到它逐秒往上涨。
           currentItem === undefined ? null : timeChip(currentItem),
+          // 「跳过」：把它写进今天的隔离名单，接力接着往下走。
+          //
+          // 为什么值得一颗按钮：等一个半天不吐字的模型自己超时，少说两分钟；
+          // 而用户往往一眼就知道「这个今天不行」。早先唯一的出路是等它报错，
+          // 或者去隔离名单上手工划 —— 前者是干等，后者是事后。
+          //
+          // 它**不是**「停止」：停止是这一轮不要了；跳过是这一轮换个人接着做。
+          // 所以按钮上写的不是「停」，点了也不该把已经吐出来的东西丢掉 ——
+          // 宿主那边等这一趟让位之后，队列会接着跑下一个候选。
+          currentItem === undefined
+            ? null
+            : h('button', {
+                type: 'button',
+                className: 'mf-btn mf-qv-skip',
+                disabled: busy === true,
+                title: t('qvSkipHint', { label: sessionItemLabel(currentItem) }),
+                'data-role': 'qv-skip',
+                onClick: (event) => {
+                  event?.preventDefault?.()
+                  event?.stopPropagation?.()
+                  onSkip?.(currentItem, row?.sessionId ?? '')
+                },
+              }, t('qvSkip')),
         ),
         div({ className: 'mf-qv-line' },
           span({ className: 'mf-qv-label' }, t('qvQuarantined')),
@@ -2736,6 +2782,49 @@ window.__ModuleLoader__.load({
       }, [busy, load, t])
 
       /**
+       * 跳过「此刻正在用的那个模型」：写进隔离名单，让接力接着换下一个。
+       *
+       * 传的是**它现在的 key**，不是「当前会话」：宿主那边要拿它写隔离记录，
+       * 而按钮长在哪一行就跳哪一行 —— 别的会话正被一个慢模型占着时，用户完全
+       * 可能想替它跳过。
+       *
+       * 失败写在 `actionError` 而不是 `error`：`error` 那条渲染时会套上「读取
+       * 失败：」，而这里是一次写操作的失败，套上去会说反话。
+       */
+      const skipOne = useCallback(async (item, sessionId) => {
+        if (busy) return
+        // 「当前」那一行报的可能是上一趟跑过的（此刻没人跑），那种条目上没有 `key`
+        // —— 它不是从名单里来的，是 `active`/(`running`) 拼出来的。宿主那边这时也
+        // 没有实时表可查，所以必须在这儿按 provider/model 拼出来，否则按钮点了只会
+        // 得到一句「要跳过哪一个」。
+        const targetKey = typeof item?.key === 'string' && item.key !== ''
+          ? item.key
+          : (typeof item?.provider === 'string' && typeof item?.model === 'string'
+              ? keyOf(item.provider, item.model)
+              : '')
+        if (targetKey === '') return
+        setBusy(true)
+        try {
+          const next = await post('/skip', {
+            sessionId,
+            templateId: item?.templateId,
+            // 带上它省得宿主再去查实时表：正在跑的那一趟和「上一趟跑的是谁」
+            // 在换人那一瞬间不一样，而用户点的就是眼前显示的那一个。
+            key: targetKey,
+          })
+          if (!alive.current) return
+          if (Array.isArray(next?.sessions)) setData((previous) => ({ ...(previous ?? {}), ...next }))
+          setActionError('')
+          void load(false)
+        } catch (failure) {
+          if (!alive.current) return
+          setActionError(t('qvSkipFailed', { message: String(failure?.message ?? failure) }))
+        } finally {
+          if (alive.current) setBusy(false)
+        }
+      }, [busy, load, t])
+
+      /**
        * 右键一条隔离记录：把它的报错整块塞进剪贴板。
        *
        * 复制失败时**写进 error 那一行**，不假装成功 —— 这颗胶囊闪一下「已复制」
@@ -2846,6 +2935,8 @@ window.__ModuleLoader__.load({
                 // 会话号由这一行自己带进去：叉叉长在哪个会话卡上，删的就是哪个会话
                 // 的那条记录 —— 不用用户先「选中」什么，也没有第二种解释。
                 onForget: (item, kind) => void forgetOne(item, kind, row.sessionId),
+                // 跳过也是同理：按钮长在哪一行就跳哪一行正在用的那个模型。
+                onSkip: (item, sessionId) => void skipOne(item, sessionId),
                 onCopyError: (item, chipKey) => void copyError(item, chipKey),
                 copiedKey: copied,
                 nowMs,

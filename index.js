@@ -946,6 +946,49 @@ export function apply(ctx, _config) {
         return
       }
 
+      if (method === 'POST' && path === '/skip') {
+        // 会话页「正在用的模型」后面那颗「跳过」：把这个模型写进今天的隔离名单，
+        // 正在跑的那一趟当场让位，队列接着换下一个。
+        //
+        // 和 `/forget-record` 是反动作：那个从名单上删一条，这个往名单上加一条。
+        // 和「等它自己报错」也不同 —— 用户看着它半天不吐字，愿意先换个人顶上，
+        // 而不是陪着它把超时等满。
+        //
+        // 一次请求把三件事都做完（写隔离、交还名额、掐掉在跑的那一趟），所以
+        // 它走 adapter 而不是直接在 index.js 里拼：那三笔账的判据都在 adapter
+        // 手里（见 `lib/adapter.js` 的 `skip()`）。
+        const body = await readJsonBody(req)
+        const outcome = adapter.skip({
+          sessionId: typeof body?.sessionId === 'string' ? body.sessionId : sessionId,
+          templateId: typeof body?.templateId === 'string' ? body.templateId : undefined,
+          key: typeof body?.key === 'string' ? body.key : undefined,
+        })
+        if (outcome.ok !== true) {
+          sendJson(res, 400, { ok: false, error: '要跳过哪一个？既没给 key，也没有正在跑的模型' })
+          return
+        }
+        pushEvent({
+          at: now,
+          kind: 'skip',
+          key: outcome.key,
+          provider: outcome.provider,
+          model: outcome.model,
+          // 按下去时它正在跑，还是只是排在队首 —— 界面上是两句不同的话。
+          live: outcome.live,
+          sessionId: typeof body?.sessionId === 'string' ? body.sessionId : sessionId,
+          templateId: typeof body?.templateId === 'string' ? body.templateId : undefined,
+        })
+        sendJson(res, 200, {
+          ok: true,
+          key: outcome.key,
+          provider: outcome.provider,
+          model: outcome.model,
+          live: outcome.live,
+          sessions: sessionRows(now),
+        })
+        return
+      }
+
       if (method === 'POST' && path === '/forget') {
         // 「恢复出厂」：删掉状态文件，下一次调用重新从第一个模型开始。
         removeFile(join(dir, 'state.json'))
