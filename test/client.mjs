@@ -1326,6 +1326,74 @@ await check('隔离队列：换人的那一瞬间，「正在用」报的是正�
   assert.equal(flat.includes('硅基流动 · Alpha One'), false, '不能还挂着上一个模型')
 })
 
+await check('隔离队列：换人的那几秒写「正在换人」，不冒充「运行中」', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const start = intervals.length
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-swap',
+      // 这一轮已经轮到 beta 了，但这一刻还没往上打请求（在等补发间隔）。
+      active: { provider: 'alpha', model: 'one', at, label: '硅基流动 · Alpha One', templateId: 'default', templateName: '默认模板' },
+      running: {
+        provider: 'beta', model: 'one', at, since: at, streaming: false,
+        label: 'Code99 · Beta One', templateId: 'default', templateName: '默认模板',
+      },
+    }),
+  ])
+  let flat
+  let badges
+  try {
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-swap', t })))
+    badges = fresh.nodes.filter((node) => node.props?.['data-role'] === 'qv-switching')
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(badges.length, 1, '该挂「正在换人」')
+  assert.equal(badges[0].text, '正在换人')
+  assert.ok(String(badges[0].props.title ?? '').includes('Code99 · Beta One'),
+    `悬停要说清在等谁，实际是 ${badges[0].props.title}`)
+  assert.ok(String(badges[0].props.title ?? '').includes('已经等了'),
+    `悬停还要说清等了多久（用户最想知道的就是「卡在哪一步」），实际是 ${badges[0].props.title}`)
+  assert.equal(flat.includes('Code99 · Beta One'), true, '「正在用」照样报新的那个')
+  assert.equal(flat.includes('运行中'), false, '还没开口就不该写「运行中」')
+  // 轮询仍然压着 2 秒：整轮都算「有人在跑」，换人的间隙不能退回 15 秒 ——
+  // 退回去就等于把「滞后 15 秒」这个 bug 又种回来了。第一拍必然是 15 秒（那时
+  // 还没拿到 data，只能按「不知道有没有人在跑」来问），要紧的是拿到之后那一拍。
+  const used = intervals.slice(start)
+  assert.ok(used.includes(2000), `换人间隙也要按 2 秒轮询，实际 ${used.join(', ')}`)
+  assert.equal(used.at(-1), 2000, `拿到数据之后应当一直按 2 秒问，实际 ${used.join(', ')}`)
+})
+
+await check('隔离队列：正在换人时，那个模型的使用时长不跟着涨', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-wait',
+      active: undefined,
+      good: [
+        // 它以前跑过 3 秒，那是真实用掉的。
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', at, sessionId: 's-wait', label: 'Code99 · Beta One', speed: { tokens: 30, ms: 3000, runs: 1, at } },
+      ],
+      running: {
+        provider: 'beta', model: 'one', at: at - 90_000, since: at - 90_000, streaming: false,
+        label: 'Code99 · Beta One', templateId: 'default', templateName: '默认模板',
+      },
+    }),
+  ])
+  let times
+  try {
+    await fresh.mount(queue({ sessionId: 's-wait', t }))
+    times = fresh.nodes.filter((node) => node.props?.['data-role'] === 'usage-time')
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(times.length, 1)
+  assert.equal(times[0].text, '3.0s', '等着的时候不该把等待算成「用掉了多久」')
+  assert.equal(String(times[0].props.className).includes('mf-time-live'), false, '也不该标成「还在涨」')
+})
+
 await check('隔离队列：没人跑的时候才回落到「上一趟是谁」', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch

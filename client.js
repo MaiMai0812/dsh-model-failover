@@ -94,6 +94,9 @@ window.__ModuleLoader__.load({
 .mf-badge.mf-bad { border-color: color-mix(in srgb, #e5484d 55%, transparent); color: #e5484d; opacity: 1; }
 .mf-badge.mf-ok { border-color: color-mix(in srgb, #30a46c 55%, transparent); color: #30a46c; opacity: 1; }
 .mf-badge.mf-run { border-color: color-mix(in srgb, #4c9aff 55%, transparent); color: #4c9aff; opacity: 1; }
+/* 「这一轮已经轮到它、但还没有请求在飞」：同一个颜色，淡一档、虚线边。
+   用同一族色是有意的 —— 与「运行中」是同一件事的两个时刻，不是两种状态。 */
+.mf-badge.mf-swap { border-color: color-mix(in srgb, #4c9aff 34%, transparent); border-style: dashed; color: color-mix(in srgb, #4c9aff 75%, transparent); }
 .mf-actions { display: flex; gap: 4px; flex: none; }
 /* 正在编辑的那个模板：左边一条竖线，比整行换底色更不刺眼。 */
 .mf-row-on { background: color-mix(in srgb, currentColor 6%, transparent); box-shadow: inset 2px 0 0 currentColor; }
@@ -393,6 +396,9 @@ window.__ModuleLoader__.load({
         qvQueued: '已验证',
         qvCurrent: '当前会话',
         qvRunning: '运行中',
+        qvSwitching: '正在换人',
+        qvSwitchingHint: '这个会话这一轮已经轮到 {label} 了，正在等它开口（补发间隔 / 让前一格歇一会儿）。这一刻还没往上打请求，所以不写「运行中」。',
+        qvSwitchingWait: '已经等了 {text}。',
         qvUnnamed: '未命名会话',
         qvUnscoped: '后台任务（不挂在任何会话下）',
         qvDay: '当前逻辑日 {day}',
@@ -604,6 +610,9 @@ window.__ModuleLoader__.load({
         qvQueued: 'Verified',
         qvCurrent: 'This conversation',
         qvRunning: 'Running',
+        qvSwitching: 'Switching',
+        qvSwitchingHint: 'This conversation has already moved on to {label} and is waiting for it to start (the continue delay, or letting the previous slot rest). No request is in flight yet, so it does not say “Running”.',
+        qvSwitchingWait: 'Waiting {text} so far.',
         qvUnnamed: 'Untitled conversation',
         qvUnscoped: 'Background work (not tied to a conversation)',
         qvDay: 'Logical day {day}',
@@ -2421,8 +2430,15 @@ window.__ModuleLoader__.load({
         }, text)
       }
 
-      // 此刻正在跑的那个（有就说明有人在写字）。下面的时间小框要用它。
+      // 此刻正在跑的那个。下面的时间小框要用它。
       const running = row?.running
+      /**
+       * 这一轮已经轮到它了，但请求还没上去（补发间隔 / 让前一格歇一会儿）。
+       *
+       * 与 `running` 的区别只在「上游有没有在吐字」，但这一点对用户很要紧：
+       * 写「运行中」却半天没字，会被读成卡死；而写「正在换人」就说明白了。
+       */
+      const switching = running !== undefined && running.streaming === false
       /** 「当前」那一行报的是谁：正在跑的优先，没有就是上一趟跑过的。 */
       const currentItem = running ?? active
 
@@ -2440,7 +2456,11 @@ window.__ModuleLoader__.load({
           && String(running.model ?? '') === String(item?.model ?? '')
           && (running.templateId ?? undefined) === (item?.templateId ?? undefined)
         const base = Number.isFinite(item?.speed?.ms) && item.speed.ms > 0 ? item.speed.ms : 0
-        const live = mineRunning ? Math.max(0, Number(nowMs) - Number(running.at ?? nowMs)) : 0
+        // 换人之间的等待不算「用掉了多久」：这段时间没往上打请求，算进去会让
+        // 用户以为这个模型很慢，其实是队列在等。
+        const live = mineRunning && switching === false
+          ? Math.max(0, Number(nowMs) - Number(running.at ?? nowMs))
+          : 0
         const ms = base + live
         if (ms <= 0) return null
         return span({
@@ -2480,7 +2500,18 @@ window.__ModuleLoader__.load({
       return div({ className: mine ? 'mf-qv-session mf-mine' : 'mf-qv-session' },
         div({ className: 'mf-qv-top' },
           span({ className: 'mf-qv-title' }, title === undefined || title === '' ? t('qvUnnamed') : title),
-          running === undefined ? null : span({ className: 'mf-badge mf-run' }, t('qvRunning')),
+          running === undefined
+            ? null
+            : span({
+                className: switching ? 'mf-badge mf-swap' : 'mf-badge mf-run',
+                'data-role': switching ? 'qv-switching' : 'qv-running',
+                // 「正在换人」要能自己说清在等谁、为什么没有字、等了多久。
+                title: switching
+                  ? `${t('qvSwitchingHint', { label: sessionItemLabel(running) })}\n${t('qvSwitchingWait', {
+                      text: formatDuration(Math.max(0, Number(nowMs) - Number(running.since ?? running.at ?? nowMs))),
+                    })}`
+                  : undefined,
+              }, switching ? t('qvSwitching') : t('qvRunning')),
           mine ? span({ className: 'mf-badge mf-ok' }, t('qvCurrent')) : null,
           span({ className: 'mf-qv-id' }, fullId(row?.sessionId)),
           // 解除按钮就在这一行上：解哪个会话的隔离，按钮长在哪个会话上最没歧义。

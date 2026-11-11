@@ -220,7 +220,7 @@ function createLlm(scripts) {
  * @param {number} [spec.at] - 初始「现在」。
  * @param {object} [spec.cacheFile] - 扫描缓存落盘用的 JsonFile（验跨启动延续时才给）。
  */
-async function harness({ order, scripts, settings: overrides = {}, at = new Date(2026, 1, 14, 6, 0, 0).getTime(), cacheFile, sleepAdvancesClock = false }) {
+async function harness({ order, scripts, settings: overrides = {}, at = new Date(2026, 1, 14, 6, 0, 0).getTime(), cacheFile, sleepAdvancesClock = false, onWait }) {
   const llm = createLlm(scripts)
   llm.register('alpha', [{ id: 'one', name: 'Alpha One' }, { id: 'two', name: 'Alpha Two' }])
   llm.register('beta', [{ id: 'one', name: 'Beta One' }, { id: 'two', name: 'Beta Two' }])
@@ -278,6 +278,9 @@ async function harness({ order, scripts, settings: overrides = {}, at = new Date
     now: () => clock.ms,
     sleep: async (ms) => {
       waits.push(ms)
+      // 让用例可以在「等待中」这一瞬间看一眼实时表：换人的显示滞后正是在这段
+      // 时间里发生的（过去这段里 `live` 是空的，界面只好退回上一个模型）。
+      if (typeof onWait === 'function') await onWait(ms)
       // 「等一会儿再复查」的用例需要时间真的走：默认不走，免得既有的计时断言
       // 被这 5 秒悄悄带偏。
       if (sleepAdvancesClock === true) clock.ms += ms
@@ -1097,6 +1100,88 @@ await check('手动跳过：跳过之后这一趟不再用它，下一次调用�
   }))
   assert.equal(textOf(second), '我后', '隔离了就不该再排到队首')
   assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one'), routeKey('beta', 'one')])
+})
+
+// 8.7 · 换人时的实时表：整轮都在，且分清「在等」和「在吐字」
+await check('换人显示：换过去等「继续」的那几秒，实时表已经指向新的那个', async () => {
+  // 这段等待正是用户看到「还在显示上一个模型」的时刻：早先 `live` 只包住
+  // 单次请求，一换人就是空的，界面只好回落到「上一趟是谁」。
+  const seen = []
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    settings: { sameModelRetries: 0 },
+    scripts: new Map([[routeKey('alpha', 'one'), quota()], [routeKey('beta', 'one'), ok('好')]]),
+    onWait: () => {
+      const hit = h.adapter.liveFor('sess-swap')
+      seen.push(hit === undefined ? undefined : { key: hit.key, streaming: hit.streaming })
+    },
+  })
+  const chunks = await drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('写')], sessionId: 'sess-swap',
+  }))
+  assert.equal(textOf(chunks), '好')
+  assert.deepEqual(seen, [{ key: routeKey('beta', 'one'), streaming: false }],
+    '等「继续」的那几秒就该报 beta，而且是「在等」不是「在吐字」')
+  // 整轮结束了才收摊。
+  assert.equal(h.adapter.liveFor('sess-swap'), undefined, '跑完就该把这一格清掉')
+})
+
+await check('换人显示：中途每换一个候选都会立刻改口，不是等下一趟', async () => {
+  const seen = []
+  const h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one' },
+      { provider: 'beta', model: 'one' },
+      { provider: 'beta', model: 'two' },
+    ],
+    settings: { sameModelRetries: 0 },
+    scripts: new Map([
+      [routeKey('alpha', 'one'), quota()],
+      [routeKey('beta', 'one'), quota()],
+      [routeKey('beta', 'two'), ok('终于好')],
+    ]),
+    onWait: () => { seen.push(h.adapter.liveFor('sess-chain')?.key) },
+  })
+  const chunks = await drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('写')], sessionId: 'sess-chain',
+  }))
+  assert.equal(textOf(chunks), '终于好')
+  assert.deepEqual(seen, [routeKey('beta', 'one'), routeKey('beta', 'two')],
+    '两次等待各自报的应当是即将去试的那个')
+})
+
+await check('换人显示：正在吐字时标记为 streaming，「还没开口」不算进去', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }],
+    settings: { sameModelRetries: 0 },
+    scripts: new Map([[routeKey('alpha', 'one'), async function* () {
+      // 先探一眼：请求已经在飞了，这一刻应当是 streaming。
+      yield { type: 'text-delta', index: 0, text: '先吐一个字' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }]]),
+  })
+  const chunks = await drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('写')], sessionId: 'sess-live',
+  }))
+  assert.equal(textOf(chunks), '先吐一个字')
+  assert.equal(h.adapter.liveFor('sess-live'), undefined, '收工就清掉')
+})
+
+await check('换人显示：会话标题这类内部调用不占这一格', async () => {
+  let during
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }],
+    settings: { sameModelRetries: 0 },
+    scripts: new Map([[routeKey('alpha', 'one'), async function* () {
+      during = h.adapter.liveFor('sess-internal')
+      yield { type: 'text-delta', index: 0, text: '标题' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }]]),
+  })
+  await drain(h.adapter.stream({
+    provider: ROUTE, model: 'default', messages: [user('起标题')], sessionId: 'sess-internal', purpose: 'session-title',
+  }))
+  assert.equal(during, undefined, '共用 sessionId 的内部调用不该在会话页闪一下')
 })
 
 // 9 · 补发节奏：每次换人带「继续」之前先等一等

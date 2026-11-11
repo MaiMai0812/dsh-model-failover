@@ -647,12 +647,20 @@ export function apply(ctx, _config) {
     }
     // 此刻正在跑的候选：单独一份，不覆盖 `active`（那是「上一趟跑的是谁」，
     // 两者在换人的那一瞬间会不一样，界面要能同时说清）。
+    //
+    // 这一份是**整轮**的，不是「一次请求」的：换人之间的等待（补发间隔、并发
+    // 收工冷却）里它仍然在，`streaming` 才说明上游此刻是不是真的在吐字。早先
+    // 这里只在请求进行中才有值，于是换人的那几秒会话页退回「上一趟是谁」，
+    // 用户看到的就是「明明已经在用下一个了，那一栏还写着上一个」。
     for (const [sessionId, hit] of adapter.liveSessions()) {
       const row = rowOf(sessionId)
       row.running = {
         provider: hit.provider,
         model: hit.model,
         at: hit.startedAt,
+        // 这一轮从什么时候起轮到它（换人就重置），界面据此说「刚换过来」。
+        since: hit.since ?? hit.startedAt,
+        streaming: hit.streaming !== false,
         label: labelOf(hit.provider, hit.model),
         templateId: hit.templateId,
         templateName: hit.templateId === undefined ? '' : templateName(hit.templateId),
