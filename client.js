@@ -310,6 +310,11 @@ window.__ModuleLoader__.load({
         optBillRealModel: '按真正跑的那个模型记账',
         optBillRealModelHint:
           '本插件是包装路由：宿主发起的调用叫「模型接力」，真正跑的是队列里的某个候选。打开这一项，账单会记在那个候选自己的名字和价格上，而不是全都算在「模型接力」名下。需要装 dsh-cost-meter；装了她却没生效时重启一次 DSH。关掉就回到旧行为。',
+        billAttached: '已接管',
+        billDetached: '没接管',
+        billWaiting: '还没接到计费桥 —— 装好 dsh-cost-meter 后会自动接上',
+        billSummary: '这一进程：路由名调用 {routed} 次，其中 {billed} 次记到了真实模型名下',
+        billStuck: '这些调用一次都没落到真实模型名下，账单仍是「模型接力」的。关掉再打开这一项，或者重启 DSH。',
         optAllQuarantined: '全部被隔离时仍然按顺序试一遍',
         optAllQuarantinedHint: '关掉后队列里全是隔离模型时会直接报错，不再尝试。',
         optKeepLog: '记录事件日志',
@@ -528,6 +533,11 @@ window.__ModuleLoader__.load({
         optBillRealModel: 'Bill the model that actually ran',
         optBillRealModelHint:
           'This plugin is a wrapping route: the host calls "Model Relay", but the real request goes to one of the queued candidates. With this on, the bill lands on that candidate\'s own name and price instead of all being counted under "Model Relay". Needs dsh-cost-meter; if it is installed and this still does not take effect, restart DSH once. Turned off, billing goes back to the old behaviour.',
+        billAttached: 'attached',
+        billDetached: 'not attached',
+        billWaiting: 'No billing bridge yet — it attaches by itself once dsh-cost-meter is installed',
+        billSummary: 'This process: {routed} routed calls, {billed} of them billed to the real model',
+        billStuck: 'Not one of them reached the real model, so the bill is still under "Model Relay". Toggle this off and on again, or restart DSH.',
         optAllQuarantined: 'Still try the queue when all are quarantined',
         optAllQuarantinedHint: 'Turned off, an all-quarantined queue fails immediately.',
         optKeepLog: 'Keep an event log',
@@ -1472,6 +1482,38 @@ window.__ModuleLoader__.load({
         [templates, probeTick],
       )
 
+      /**
+       * 「账单记在谁名下」这一项的实况。
+       *
+       * 宿主在 `/state` 里自报接管状态（`billing`），这里只负责翻译成人话。三种
+       * 情况都要能一眼看出来：
+       *   · 没接上桥（`attached === false`）—— 账一定还记在路由名下；
+       *   · 接上了、也真的落过账 —— 正常；
+       *   · 接上了，但这一进程里所有路由名调用一次都没落到真实模型名下 —— 最阴的
+       *     一种：开关是开的、状态是「已接管」，账单却整片记在「模型接力」名下。
+       */
+      const billingNote = () => {
+        const billing = state?.billing
+        // 关掉这一项时不必解释什么：账本来就该记在路由名下。
+        if (settings?.billByRealModel === false || billing === undefined || billing === null) return null
+        const routed = Number(billing.routed) || 0
+        const billed = Number(billing.billed) || 0
+        const attached = billing.attached === true
+        const stuck = attached && routed > 0 && billed === 0
+        const badge = h('span', {
+          className: `mf-badge ${attached ? 'mf-ok' : 'mf-bad'}`,
+          'data-role': 'billing-state',
+        }, attached ? t('billAttached') : t('billDetached'))
+        const said = attached
+          ? [t('billSummary', { routed, billed }), stuck ? t('billStuck') : ''].filter(Boolean).join(' ')
+          : t('billWaiting')
+        return div({ className: 'mf-opt', 'data-role': 'billing-note' },
+          div({ className: 'mf-opt-main' },
+            div(null, badge, span({ className: 'mf-note', style: { marginLeft: '8px' } }, said)),
+          ),
+        )
+      }
+
       /** 试连接结果的那颗小胶囊：文字与悬停说明。 */
       const probeText = (row) => (row.state === 'busy' ? t('probeBusy') : row.state === 'ok' ? t('probeOk') : t('probeBad'))
       const probeHint = (row) => {
@@ -2021,6 +2063,10 @@ window.__ModuleLoader__.load({
               disabled: busy,
               onChange: (value) => void run('/settings', { billByRealModel: value }),
             }),
+            // 这一项以前是「打开就以为好了」：桥没接上时界面没有任何迹象，只有
+            // 翻账本才会发现整天都记在路由名下。所以把宿主自报的接管状态直接摆在
+            // 开关下面 —— 接上了、还没接上、接上了却一次都没落账，三种都看得见。
+            billingNote(),
             h(ToggleRow, {
               label: t('optAllQuarantined'),
               hint: t('optAllQuarantinedHint'),

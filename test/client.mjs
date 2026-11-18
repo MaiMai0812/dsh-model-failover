@@ -3619,6 +3619,60 @@ await check('计费按真实模型：设置页有一颗开关，默认开着，�
   assert.deepEqual(backPosts.map((row) => row.body), [{ billByRealModel: true }])
 })
 
+await check('计费按真实模型：设置页把「到底接管上没有」写出来，别让人以为开了就行', async () => {
+  const saved = globalThis.fetch
+  const noteOf = (runtime) => runtime.nodes.find((node) => node.props?.['data-role'] === 'billing-note')
+  const badgeOf = (runtime) => runtime.nodes.find((node) => node.props?.['data-role'] === 'billing-state')
+
+  /** 拿一份改过 `billing` 的 payload 渲染一次，返回渲染结果。 */
+  const render = async (billing) => {
+    const runtime = new Runtime()
+    const state = initialState()
+    if (billing !== undefined) state.billing = billing
+    globalThis.fetch = async () => payloadResponse(state)
+    try {
+      const tree = await runtime.mount(page({ close() {}, t }))
+      return { runtime, flat: runtime.text(tree) }
+    } finally {
+      globalThis.fetch = saved
+    }
+  }
+
+  // ① 旧宿主（响应里根本没有这个字段）：什么都不画，不能凭空吓人。
+  const legacy = await render(undefined)
+  assert.equal(noteOf(legacy.runtime), undefined, '宿主没报状态时不画这一行')
+
+  // ② 桥还没接上：明说「还没接到」，而不是留着开关装没事。
+  const detached = await render({ attached: false, routed: 0, billed: 0, unbilled: 0 })
+  assert.equal(badgeOf(detached.runtime).text, '没接管')
+  assert.ok(detached.flat.includes('还没接到计费桥'), `要写清在等什么：${detached.flat.slice(0, 200)}`)
+
+  // ③ 接上了、也真的落过账：正常态。
+  const good = await render({ attached: true, routed: 12, billed: 12, unbilled: 0 })
+  assert.equal(badgeOf(good.runtime).text, '已接管')
+  assert.ok(good.flat.includes('路由名调用 12 次，其中 12 次记到了真实模型名下'), good.flat.slice(0, 200))
+  assert.ok(!good.flat.includes('账单仍是「模型接力」的'), '一切正常时不该出现告警')
+
+  // ④ 最阴的一种：接上了、状态是「已接管」，但一次都没落到真实模型名下。
+  const stuck = await render({ attached: true, routed: 9, billed: 0, unbilled: 9 })
+  assert.equal(badgeOf(stuck.runtime).text, '已接管')
+  assert.ok(stuck.flat.includes('一次都没落到真实模型名下'), `要点破这种状态：${stuck.flat.slice(0, 240)}`)
+  assert.ok(stuck.flat.includes('重启 DSH'), '得给出下一步怎么做')
+
+  // ⑤ 用户自己关掉这一项时不必解释：账本来就该记在路由名下。
+  const off = new Runtime()
+  const offState = initialState()
+  offState.settings = { ...offState.settings, billByRealModel: false }
+  offState.billing = { attached: false, routed: 0, billed: 0, unbilled: 0 }
+  globalThis.fetch = async () => payloadResponse(offState)
+  try {
+    await off.mount(page({ close() {}, t }))
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(noteOf(off), undefined, '关掉之后不必再提接管状态')
+})
+
 await check('并发收工冷却：正在歇的候选在队列行上写明还要歇几秒，也不当「下一个」', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch

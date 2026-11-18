@@ -47,7 +47,7 @@ import { Cooldowns } from './lib/cooldown.js'
 import { DailyHealth, nextResetAt, normalizeState } from './lib/health.js'
 import { Concurrency, MAX_CONCURRENCY, concurrencyOf } from './lib/limits.js'
 import { TurnNotes } from './lib/notes.js'
-import { ensureBillingAttribution, releaseBillingAttribution } from './lib/billing-attribution.js'
+import { ensureBillingAttribution, releaseBillingAttribution, billingAttributionStatus } from './lib/billing-attribution.js'
 import { JsonFile, dataDir, removeFile } from './lib/store.js'
 import { rejectionFor } from './lib/trust.js'
 
@@ -470,11 +470,15 @@ export function apply(ctx, _config) {
   //
   // 时机是个问题：那个桥对象是 dsh-cost-meter 在它自己 `apply()` 里挂到
   // `globalThis` 上的，谁先加载取决于插件顺序。所以装不上不算错 —— 先记一笔
-  // 日志，然后隔一小会儿重试几次（都在毫秒级，对启动没有任何压力），十几秒
-  // 之后还装不上就放弃：那说明这个进程里根本没装 dsh-cost-meter。
+  // 日志，然后隔一小会儿重试几次（都在毫秒级，对启动没有任何压力）。
+  //
+  // 重试跑完之后也不是就不管了：`ensureBillingAttribution()` 会在 `globalThis`
+  // 上留一个访问器，之后 cost-meter 再装桥（重载、热更、卸载后重挂）都会被自动
+  // 包好；`dispatchNested()` 每趟还顺手补一次。以前只重试八次就收手，结果运行
+  // 了一整天的实例仍然把账记在路由名上，而界面与日志都毫无迹象。
   let stopBillingRetry
   try {
-    /** 重试的间隔（毫秒）。最后一档落在 8 秒后，合计八次尝试。 */
+    /** 重试的间隔（毫秒）。最后一档落在 4 秒后，合计七次尝试。 */
     const RETRY_DELAYS = [200, 300, 500, 1_000, 2_000, 4_000]
     /** 已经排出去第几档延迟 —— 只用来取下一档，不参与「装成功没有」的判断。 */
     let pending = 0
@@ -496,7 +500,8 @@ export function apply(ctx, _config) {
           return
         }
         if (pending >= RETRY_DELAYS.length) {
-          logger.warn?.('model-failover: 没找到 dsh-cost-meter 的计费桥，账单仍会记在「模型接力」名下（装了它之后重启即可）')
+          // 这里不再是「放弃」：访问器已经装上了，桥什么时候来都会被包好。
+          logger.warn?.('model-failover: 启动时没等到 dsh-cost-meter 的计费桥，它一装好就会自动接管（账单不会记在「模型接力」名下）')
           stopBillingRetry = undefined
           return
         }
@@ -773,6 +778,10 @@ export function apply(ctx, _config) {
       // 显示，设置页的队列行也可以直接读这份；`maxConcurrency` 是输入框的上界。
       limits: limitsView(undefined),
       maxConcurrency: MAX_CONCURRENCY,
+      // 计费归属此刻到底有没有挂上 —— 以前这类故障是完全不可见的：界面照常跑，
+      // 日志一片安静，只有翻账本才会发现整天都记在「模型接力」名下。
+      // `attached === false` 而 `routed > 0` 就是「补丁没生效」的指纹。
+      billing: billingAttributionStatus(),
       // 每模型当天的失败/成功次数（所有会话、所有模板合计）——设置页队列前面
       // 那对红绿数字就是它。
       counts: view.counts,

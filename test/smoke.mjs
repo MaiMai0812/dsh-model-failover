@@ -30,7 +30,7 @@ const { DEFAULT_SETTINGS, ROUTE, routeKey } = await import('../lib/constants.js'
 const { TurnNotes } = await import('../lib/notes.js')
 const { Cooldowns } = await import('../lib/cooldown.js')
 const { Concurrency, concurrencyOf, MAX_CONCURRENCY } = await import('../lib/limits.js')
-const { ensureBillingAttribution, releaseBillingAttribution } = await import('../lib/billing-attribution.js')
+const { ensureBillingAttribution, releaseBillingAttribution, billingAttributionStatus, dispatchNested, resetBillingAttributionStats } = await import('../lib/billing-attribution.js')
 
 // ── 假的宿主 ────────────────────────────────────────────────────────────────
 
@@ -2362,6 +2362,107 @@ await check('计费归属：重复装、卸载后还原，桥对象上不留多�
     assert.equal(bridge.createScope, original, '卸载要把原来的函数放回去')
     assert.equal(releaseBillingAttribution(), false, '卸载两次不该出问题')
   } finally {
+    delete globalThis[BRIDGE_KEY]
+  }
+})
+
+await check('计费归属：桥晚到、或者被换掉，都要自己接回去（别只试八次就收手）', async () => {
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+  const scopes = []
+  const makeBridge = (tag) => ({
+    tag,
+    createScope: (options) => {
+      scopes.push(`${tag}:${options?.provider}/${options?.model}`)
+      return { run: (operation) => operation(), observe: () => {}, finish: async () => false }
+    },
+  })
+
+  delete globalThis[BRIDGE_KEY]
+  try {
+    // ① 本插件先起来，桥还没挂：装不上是正常的，不许抛。
+    const early = ensureBillingAttribution(ROUTE, { enabled: () => true })
+    assert.equal(early.ok, false)
+    assert.equal(early.reason, 'no-bridge')
+
+    // ② 桥晚到（cost-meter 后加载）—— 赋值那一刻就该被包好，不用等谁再来装一次。
+    const late = makeBridge('late')
+    globalThis[BRIDGE_KEY] = late
+    const outerLate = bridge_create(late, ROUTE)
+    assert.deepEqual(scopes, [], '晚到的桥也要立刻接管：外层不该建 scope')
+
+    // ③ 桥被整个换掉（cost-meter 重载）：新对象同样要接上。
+    const replaced = makeBridge('replaced')
+    globalThis[BRIDGE_KEY] = replaced
+    bridge_create(replaced, ROUTE)
+    assert.deepEqual(scopes, [], '换过的桥也要立刻接管')
+
+    // ④ 桥被删掉（`dispose()`）之后重新赋值：访问器跟着被删过，赋值那一刻没
+    //    人接。真实流程里下一次派发会顺手补上 —— 这里就按真实流程走一遍。
+    delete globalThis[BRIDGE_KEY]
+    const again = makeBridge('again')
+    globalThis[BRIDGE_KEY] = again
+    dispatchNested(() => undefined)
+    bridge_create(again, ROUTE)
+    assert.deepEqual(scopes, [], '删掉重装的桥也要接管')
+
+    // ⑤ 真的内层调用照样放行 —— 接管不是把所有人都摁住。
+    const real = again.createScope({ provider: 'alpha', model: 'one' }, 1_000)
+    assert.equal(typeof real?.run, 'function')
+    assert.deepEqual(scopes, ['again:alpha/one'], '内层该照常建 scope')
+
+    // ⑥ 状态自报：接上了，而且外层调用过。
+    const status = billingAttributionStatus()
+    assert.equal(status.attached, true)
+    assert.ok(status.routed >= 3, `外层调用次数要记着：${status.routed}`)
+
+    // ⑦ 卸载还原时不能把「装访问器那一刻的旧桥」写回去 —— 期间桥已经换过三次。
+    assert.equal(releaseBillingAttribution(), true)
+    assert.equal(globalThis[BRIDGE_KEY], again, '还原后全局上仍是最新的那座桥')
+    assert.equal(typeof again.createScope, 'function')
+    assert.equal(again[Symbol.for('model-failover.billing-attribution')], undefined, '标记要摘掉')
+  } finally {
+    releaseBillingAttribution()
+    delete globalThis[BRIDGE_KEY]
+  }
+})
+
+/** 拿一个假桥当 cost-meter 用：以本路由的身份建一次 scope（= 一次用户轮的开头）。 */
+function bridge_create(bridge, route) {
+  return bridge.createScope({ provider: route, model: 'default', sessionId: 's1' }, 1_000)
+}
+
+await check('计费归属：外层没落账时状态里看得见，不是只有翻账本才知道', async () => {
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+  const bridge = {
+    createScope: (options) => {
+      const nested = options?.provider !== ROUTE
+      return { run: (operation) => operation(), observe: () => {}, finish: async () => false }
+    },
+  }
+  globalThis[BRIDGE_KEY] = bridge
+  try {
+    assert.equal(ensureBillingAttribution(ROUTE, { enabled: () => true }).ok, true)
+    resetBillingAttributionStats()
+    ensureBillingAttribution(ROUTE, { enabled: () => true })
+
+    // 外层建了 scope、内层一次都没建 → 收尾时只能承认「没覆盖」。
+    const stuck = bridge.createScope({ provider: ROUTE, model: 'default', sessionId: 's1' }, 1_000)
+    assert.equal(await stuck.finish(), false, '内层没落账，就不能冒认已覆盖')
+    const afterStuck = billingAttributionStatus()
+    assert.ok(afterStuck.routed >= 1, '外层调用要记数')
+    assert.ok(afterStuck.unbilled >= 1, '没落账的那一次要单独记着 —— 这就是「补丁没生效」的指纹')
+
+    // 内层真的建了 scope（在凭据里记一笔）→ 外层才敢说覆盖了。
+    const record = bridge.createScope({ provider: ROUTE, model: 'default', sessionId: 's1' }, 1_001)
+    const done = await record.run(async () => {
+      bridge.createScope({ provider: 'alpha', model: 'one' }, 1_002)
+      return record.finish()
+    })
+    assert.equal(done, true, '内层落过账，外层就该说已覆盖')
+    const afterGood = billingAttributionStatus()
+    assert.ok(afterGood.billed >= 1, `落账次数要涨：${afterGood.billed}`)
+  } finally {
+    releaseBillingAttribution()
     delete globalThis[BRIDGE_KEY]
   }
 })
