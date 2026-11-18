@@ -3420,8 +3420,28 @@ await check('导入模板：不是 JSON、或者里面没有模板，都如实�
 // ── 试连接 ──────────────────────────────────────────────────────────────────
 //
 // 每个模板一颗「测试连接」：点了把这条队列里的模型挨个探一遍，结果显示在下面
-// 每个模型名字后面。结果只活在组件里，关掉设置页就没了 —— 所以这里同时断言
-// 它**没有**写回宿主：一次体检的结论过几分钟就可能不准，留着只会误导人。
+// 每个模型名字后面。结论活在整个页面里（设置页关掉再打开还在），但**不写回
+// 宿主**：一次体检的结论过几分钟就可能不准，落盘就成了一条永久事实。
+//
+// 注意顺序：结论台账是模块级的，会跨用例留下去。所以「还没测过」那一条必须
+// 排在任何一条真的点过「测试连接」的用例**前面**。
+
+await check('试连接：连不上时按钮仍是灰的，不给点空队列', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => payloadResponse(initialState())
+  let buttons
+  try {
+    await fresh.mount(page({ close() {}, t }))
+    buttons = fresh.nodes.filter((node) => node.props?.['data-role'] === 'template-probe')
+  } finally {
+    globalThis.fetch = saved
+  }
+  // 还没人点过、「备用模板」的队列也是空的：一颗胶囊都不该有，那颗按钮也不给点。
+  assert.equal(buttons.length, 2)
+  assert.equal(buttons[1].props.disabled, true)
+  assert.equal(fresh.nodes.filter((node) => node.props?.['data-role'] === 'probe').length, 0)
+})
 
 await check('试连接：每个模板一颗按钮，点了逐个探这条队列，结果显示在模型名后面', async () => {
   const fresh = new Runtime()
@@ -3475,8 +3495,69 @@ await check('试连接：每个模板一颗按钮，点了逐个探这条队列�
     ['mf-probe mf-probe-ok', 'mf-probe mf-probe-ok', 'mf-probe mf-probe-bad'],
   )
   assert.deepEqual(badges.map((badge) => badge.text), ['通', '通', '不通'])
-  assert.equal(badges[0].props.title, '30 毫秒收到回应')
-  assert.equal(badges[2].props.title, 'QUOTA — 余额不足', '不通的那颗要说清是什么错')
+  // 悬停里除结论本身，还带一句「几点测的」：结论会留到刷新页面为止，
+  // 半小时前的「通」和刚才的「通」分量不一样。
+  assert.ok(badges[0].props.title.startsWith('30 毫秒收到回应'), `实际：${badges[0].props.title}`)
+  assert.ok(badges[0].props.title.includes('测的'), '要注明是什么时候测的')
+  assert.ok(badges[2].props.title.startsWith('QUOTA — 余额不足'), '不通的那颗要说清是什么错')
+})
+
+await check('试连接：切走设置页再回来结论还在，切走时没跑完的也接着跑完', async () => {
+  const saved = globalThis.fetch
+  // 三颗探测全挂住：要的就是「还在飞的时候人已经走开了」这一幕。
+  const waiting = []
+  globalThis.fetch = (url, options = {}) => {
+    const target = String(url)
+    if (target.includes('/probe')) {
+      const body = JSON.parse(options.body)
+      return new Promise((resolve) => { waiting.push({ body, resolve }) })
+    }
+    return Promise.resolve(payloadResponse(initialState()))
+  }
+  const probeButtons = (rt) => rt.nodes.filter((node) => node.props?.['data-role'] === 'template-probe')
+  const probeBadges = (rt) => rt.nodes.filter((node) => node.props?.['data-role'] === 'probe')
+
+  try {
+    // ① 第一个页面：点「测试连接」，不等它跑完就走人。
+    const first = new Runtime()
+    await first.mount(page({ close() {}, t }))
+    void probeButtons(first)[0].props.onClick()
+    await tick()
+    // 节点表是上一次渲染留下的快照，所以要看「点完之后」的样子得再渲染一次。
+    await first.mount(page({ close() {}, t }))
+    assert.equal(waiting.length, 3, '默认模板三个模型应当各发一条，一起挂着')
+    assert.deepEqual(probeBadges(first).map((badge) => badge.text), ['测试中…', '测试中…', '测试中…'])
+
+    // ② 切到别的页面再回来 —— 这是一个**全新**的页面实例（hook 现场全新的，
+    //    跟真机上卸载再挂载一样），不是同一个组件重渲染。
+    const second = new Runtime()
+    await second.mount(page({ close() {}, t }))
+    assert.deepEqual(
+      probeBadges(second).map((badge) => badge.text),
+      ['测试中…', '测试中…', '测试中…'],
+      '回来时该看见「还在测」，而不是一片空白、也不是又从头测一遍',
+    )
+    assert.equal(probeButtons(second)[0].text, '测试中…', '那颗按钮也要认得出这一批还在跑')
+    assert.equal(probeButtons(second)[0].props.disabled, true, '正在测时不给重复点')
+    assert.equal(waiting.length, 3, '不许因为换了个页面就重发一遍')
+
+    // ③ 探测在「没人在看」的时候跑完。
+    for (const row of waiting) row.resolve(payloadResponse({ ok: true, result: { ...row.body, ok: true, ms: 30 } }))
+    await tick()
+
+    // ④ 再回来：结论是好的，而且不用重测。
+    const third = new Runtime()
+    await third.mount(page({ close() {}, t }))
+    assert.deepEqual(probeBadges(third).map((badge) => badge.text), ['通', '通', '通'])
+    assert.deepEqual(
+      probeBadges(third).map((badge) => badge.props.className),
+      ['mf-probe mf-probe-ok', 'mf-probe mf-probe-ok', 'mf-probe mf-probe-ok'],
+    )
+    assert.equal(probeButtons(third)[0].text, '测试连接', '跑完了按钮就该恢复')
+    assert.equal(waiting.length, 3, '整个过程只该发那三条')
+  } finally {
+    globalThis.fetch = saved
+  }
 })
 
 await check('并发收工冷却：设置页有这一行，显示宿主的值，失焦按 0-300 提交', async () => {
@@ -3586,22 +3667,6 @@ await check('并发收工冷却：正在歇的候选在队列行上写明还要�
     globalThis.fetch = saved
   }
   assert.equal(after.nodes.filter((node) => node.props?.['data-role'] === 'limit-cooling').length, 0)
-})
-
-await check('试连接：连不上时按钮仍是灰的，不给点空队列', async () => {
-  const fresh = new Runtime()
-  const saved = globalThis.fetch
-  globalThis.fetch = async () => payloadResponse(initialState())
-  let buttons
-  try {
-    await fresh.mount(page({ close() {}, t }))
-    buttons = fresh.nodes.filter((node) => node.props?.['data-role'] === 'template-probe')
-  } finally {
-    globalThis.fetch = saved
-  }
-  // 没测之前不该有任何胶囊：结果只属于「测过的那一次」，不是常驻标记。
-  assert.equal(buttons.length, 2)
-  assert.equal(fresh.nodes.filter((node) => node.props?.['data-role'] === 'probe').length, 0)
 })
 
 await check('卸载时 effect 的清理函数把样式表收回去', () => {

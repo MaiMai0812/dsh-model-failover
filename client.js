@@ -249,6 +249,7 @@ window.__ModuleLoader__.load({
         probeRunning: '正在等这个模型的回应',
         probeOkHint: '{ms} 毫秒收到回应',
         probeBadHint: '试连接失败',
+        probeAged: '{time} 测的',
         // 限流冷却（和隔离不是一回事：那个是「今天不行」，这个只是「等一下」）。
         coolingSec: '限流，还要 {n} 秒',
         coolingMin: '限流，还要 {n} 分',
@@ -464,6 +465,7 @@ window.__ModuleLoader__.load({
         probeRunning: 'Waiting for this model',
         probeOkHint: 'Answered in {ms} ms',
         probeBadHint: 'Connection test failed',
+        probeAged: 'tested {time}',
         coolingSec: 'Rate limited — {n}s',
         coolingMin: 'Rate limited — {n}m',
         coolingMinSec: 'Rate limited — {n}m {s}s',
@@ -814,6 +816,108 @@ window.__ModuleLoader__.load({
 
     const keyOf = (provider, model) => `${provider}\u0000${model}`
 
+    /**
+     * 试连接的结论台账：活在这一整个页面里，而不是某个组件里。
+     *
+     * 为什么不在组件里：设置页一关（切去看会话、去改别的设置）组件就没了，
+     * 正在飞的探测和已经拿到的结论跟着一起消失 —— 切回来看到的是一片空白，
+     * 只能重测一遍。所以台账放在模块作用域，设置页只当它的一个视图。
+     *
+     * 仍然**不落盘**：结论是「刚才那一刻」的体检结果，写进 settings.json 就成了
+     * 永久事实 —— 账号掉了、额度用完了，它还理直气壮写着「通」。刷新页面
+     * （真正的重新加载）会清空它，那时候重测一遍是合理的。
+     */
+    const probeStore = (() => {
+      /** `provider\0model` → `{ state, ms, code, message, at }` */
+      let rows = {}
+      /** 正在测的模板 id。 */
+      const testing = new Set()
+      const listeners = new Set()
+      const notice = () => {
+        for (const listener of [...listeners]) {
+          // 一个视图出错不该把整批探测拖垮：结论已经写进 rows 了。
+          try {
+            listener()
+          } catch {
+            // 忽略
+          }
+        }
+      }
+      return {
+        /** 当前的结论表。换了内容才换引用，视图直接读它。 */
+        get rows() {
+          return rows
+        },
+        isTesting: (templateId) => testing.has(templateId),
+        subscribe(listener) {
+          listeners.add(listener)
+          return () => { listeners.delete(listener) }
+        },
+        /** 开测一条模板：整批先标成「测试中」，进度也一起摆出去。 */
+        begin(templateId, items) {
+          const next = { ...rows }
+          for (const item of items) next[keyOf(item.provider, item.model)] = { state: 'busy' }
+          rows = next
+          testing.add(templateId)
+          notice()
+        },
+        /** 一个模型有结论了。 */
+        settle(key, row) {
+          rows = { ...rows, [key]: row }
+          notice()
+        },
+        /** 这一批跑完了（中途抛错也走这儿）。 */
+        finish(templateId) {
+          if (!testing.delete(templateId)) return
+          notice()
+        },
+      }
+    })()
+
+    /**
+     * 把一条模板里的模型挨个试一遍连接，结论写进上面的台账。
+     *
+     * 与组件无关 —— 切走设置页照样跑完，回来就能看见，不用重测。
+     *
+     * 逐个发而不是一次全发：一条模板十几个模型、每个都要等网络，一次全发等于
+     * 盯着一个不动的列表等半分钟；逐个发还能各自显示进度。
+     */
+    async function probeItems(templateId, items) {
+      if (items.length === 0 || probeStore.isTesting(templateId)) return
+      probeStore.begin(templateId, items)
+      let cursor = 0
+      const worker = async () => {
+        while (cursor < items.length) {
+          const item = items[cursor]
+          cursor += 1
+          const key = keyOf(item.provider, item.model)
+          let row
+          try {
+            const payload = await api('/probe', {
+              method: 'POST',
+              body: { provider: item.provider, model: item.model },
+              // 宿主自己 15 秒就放弃，所以这里的上限要比它宽一点，
+              // 否则先超时的是浏览器，报出来的错就看不出到底是哪一步卡住。
+              timeoutMs: 25_000,
+            })
+            const result = payload?.result ?? {}
+            row = result.ok === true
+              ? { state: 'ok', ms: result.ms }
+              : { state: 'bad', code: result.code ?? 'UNKNOWN', message: result.message ?? '' }
+          } catch (failure) {
+            row = { state: 'bad', code: 'HTTP', message: String(failure?.message ?? failure) }
+          }
+          // `at` 记在结论落地那一刻：悬停说明要拿它算「多久以前测的」。
+          probeStore.settle(key, { ...row, at: Date.now() })
+        }
+      }
+      try {
+        await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, items.length) }, () => worker()))
+      } finally {
+        probeStore.finish(templateId)
+      }
+    }
+
     /** 错误码 → 一句人话。 */
     function codeText(code) {
       const table = {
@@ -884,22 +988,32 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(false)
       const [addKey, setAddKey] = useState('')
       /**
+       * 这个面板是否还挂在页面上。
+       *
+       * 注意它管的是**本视图**：卸载之后不该再 setState，但正在飞的探测、
+       * 已经拿到的结论都另有去处（`probeStore`），不随这个标志一起作废。
+       */
+      const alive = useRef(true)
+      useEffect(() => () => { alive.current = false }, [])
+
+      /**
        * 试连接的结果，键是 `provider\0model`。
        *
-       * **刻意只放在组件里、不落盘**：一次体检的结论过几分钟就可能不准（账号
-       * 掉了、额度用完了），留着只会误导人。设置页一关，它就跟着没了。
+       * 结论存在模块级的 `probeStore` 里，这里只是它的一个视图 —— 于是「测完
+       * 切去看会话、过一会切回来」还能看见上次的结论，也能看见切走期间跑完的
+       * 那一批（面板关掉不等于把体检叫停）。仍然**不落盘**：这是「刚才那一刻」
+       * 的事实，写进 settings.json 就成了永久结论。
        */
-      const [probes, setProbes] = useState({})
-      /** 正在测哪个模板（空串 = 没有在测）。 */
-      const [probingId, setProbingId] = useState('')
+      const [probeTick, setProbeTick] = useState(0)
+      const probes = probeStore.rows
+      useEffect(() => probeStore.subscribe(() => {
+        if (alive.current) setProbeTick((value) => value + 1)
+      }), [])
       /** 上一次导入/导出的结果（空串 = 还没导过）。 */
       const [importNote, setImportNote] = useState('')
       /** 右键弹窗正开着的是哪一行（null = 没开）。 */
       const [windowFor, setWindowFor] = useState(null)
       const [, setTick] = useState(0)
-      const alive = useRef(true)
-
-      useEffect(() => () => { alive.current = false }, [])
 
       const load = useCallback(async (scan = false) => {
         try {
@@ -1336,58 +1450,40 @@ window.__ModuleLoader__.load({
        * 结果画在下面那张队列卡里，所以先把这张模板切到眼前 —— 不然点了「测试」
        * 却什么都看不见，只会让人以为按钮坏了。
        *
-       * 逐个发请求而不是一次全发：一条模板十几个模型、每个都要等网络，一次
-       * 全发等于盯着一个不动的列表等半分钟；逐个发还能各自显示进度。
+       * 真正的探测在模块级的 `probeItems` 里跑：这个面板随时可能被关掉（切去
+       * 看会话、去改别的设置），探测不该跟着一起作废 —— 回来时接着看结果。
        */
       const probeTemplate = useCallback(async (template) => {
         const items = Array.isArray(template?.order) ? [...template.order] : []
         if (items.length === 0) return
         if (template.id !== settings?.editedTemplate) selectTemplate(template.id)
-        setProbingId(template.id)
-        setProbes((previous) => {
-          const next = { ...previous }
-          for (const item of items) next[keyOf(item.provider, item.model)] = { state: 'busy' }
-          return next
-        })
-        let cursor = 0
-        const worker = async () => {
-          while (cursor < items.length) {
-            const item = items[cursor]
-            cursor += 1
-            const key = keyOf(item.provider, item.model)
-            let row
-            try {
-              const payload = await api('/probe', {
-                method: 'POST',
-                body: { provider: item.provider, model: item.model },
-                // 宿主自己 15 秒就放弃，所以这里的上限要比它宽一点，
-                // 否则先超时的是浏览器，报出来的错就看不出到底是哪一步卡住。
-                timeoutMs: 25_000,
-              })
-              const result = payload?.result ?? {}
-              row = result.ok === true
-                ? { state: 'ok', ms: result.ms }
-                : { state: 'bad', code: result.code ?? 'UNKNOWN', message: result.message ?? '' }
-            } catch (failure) {
-              row = { state: 'bad', code: 'HTTP', message: String(failure?.message ?? failure) }
-            }
-            if (!alive.current) return
-            setProbes((previous) => ({ ...previous, [key]: row }))
-          }
-        }
-        await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, items.length) }, () => worker()))
-        if (alive.current) setProbingId('')
+        await probeItems(template.id, items)
       }, [settings, selectTemplate])
+
+      /**
+       * 正在测哪个模板（空串 = 没有在测）。
+       *
+       * 从台账读而不是自己记：切走再回来，那一批可能还在跑，这颗按钮得照样
+       * 显示「测试中…」并保持灰着，不然用户会以为可以再点一次、白白重探一遍。
+       */
+      const probingId = useMemo(
+        () => templates.find((template) => probeStore.isTesting(template.id))?.id ?? '',
+        // `probeTick` 挂在 deps 上是刻意的：台账换了内容，这里要重算一次。
+        [templates, probeTick],
+      )
 
       /** 试连接结果的那颗小胶囊：文字与悬停说明。 */
       const probeText = (row) => (row.state === 'busy' ? t('probeBusy') : row.state === 'ok' ? t('probeOk') : t('probeBad'))
       const probeHint = (row) => {
         if (row.state === 'busy') return t('probeRunning')
-        if (row.state === 'ok') return t('probeOkHint', { ms: row.ms ?? 0 })
-        const code = row.code ?? 'UNKNOWN'
-        return row.message === undefined || row.message === ''
-          ? `${t('probeBadHint')} — ${code}`
-          : `${code} — ${row.message}`
+        const said = row.state === 'ok'
+          ? t('probeOkHint', { ms: row.ms ?? 0 })
+          : (row.message === undefined || row.message === ''
+              ? `${t('probeBadHint')} — ${row.code ?? 'UNKNOWN'}`
+              : `${row.code ?? 'UNKNOWN'} — ${row.message}`)
+        // 结论会一直留到刷新页面，所以得让人看得出它是几点测的 —— 半小时前
+        // 的「通」和刚才的「通」，分量不一样。
+        return Number.isFinite(row.at) ? `${said} · ${t('probeAged', { time: clock(row.at) })}` : said
       }
 
       /**
