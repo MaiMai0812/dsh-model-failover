@@ -14,6 +14,7 @@
  */
 
 import assert from 'node:assert/strict'
+import { AsyncResource } from 'node:async_hooks'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -2293,6 +2294,48 @@ await check('计费归属：外层不再记路由名，真实模型自己落一�
   } finally {
     releaseBillingAttribution()
     delete globalThis[BRIDGE_KEY]
+  }
+})
+
+await check('计费归属：宿主换了异步上下文也认得出内层那一趟（凭据挂在参数上，不只靠上下文）', async () => {
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+  const scopes = []
+  const bridge = {
+    createScope: (options) => {
+      scopes.push(`${options?.provider}/${options?.model}`)
+      return { run: (operation) => operation(), observe: () => {}, finish: async () => false }
+    },
+  }
+  // 在一段「什么上下文都没有」的地方建好，等下用它模拟宿主自己另起的一段调度：
+  // 从这上面跑出去的回调，ALS 里看不到我们的凭据 —— 真实宿主派发瀑布时就是这样。
+  const elsewhere = new AsyncResource('model-failover:test-elsewhere')
+  globalThis[BRIDGE_KEY] = bridge
+  try {
+    resetBillingAttributionStats()
+    assert.equal(ensureBillingAttribution(ROUTE, { enabled: () => true }).ok, true)
+    const outer = bridge.createScope({ provider: ROUTE, model: 'default', sessionId: 's1' }, 1_000)
+    assert.deepEqual(scopes, [], '外层是本路由，不该建 scope')
+
+    // 内层那次 `createScope()` 发生在宿主自己的调度里：ALS 断了，凭据还在参数上。
+    // 外层的 `outer.run(…)` 对应 `billing-stream.js` 里那个 `proxy.run(() => iterator.next())`。
+    const nested = { provider: 'alpha', model: 'one' }
+    const inner = outer.run(() => dispatchNested(() => elsewhere.runInAsyncScope(() => bridge.createScope(nested, 1_001)), nested))
+    assert.equal(typeof inner?.run, 'function', '内层照样要拿到真的 scope')
+    assert.deepEqual(scopes, ['alpha/one'], `内层该按真名建 scope：${JSON.stringify(scopes)}`)
+
+    // 外层收尾：认得出「已经覆盖」，不会再用路由名记一遍。
+    assert.equal(await outer.finish(), true, '内层落过账，外层就该说自己覆盖了')
+
+    // 反证：参数上不带凭据、上下文又断了，这一趟就不该算进外层 —— 说明凭据不是摆设。
+    const stray = { provider: 'alpha', model: 'one' }
+    elsewhere.runInAsyncScope(() => bridge.createScope(stray, 1_002))
+    const status = billingAttributionStatus()
+    assert.equal(status.billed, 1, `只有带凭据的那一趟算数：${JSON.stringify(status)}`)
+    assert.equal(status.unbilled, 0)
+  } finally {
+    releaseBillingAttribution()
+    delete globalThis[BRIDGE_KEY]
+    elsewhere.emitDestroy()
   }
 })
 
