@@ -47,6 +47,7 @@ import { Cooldowns } from './lib/cooldown.js'
 import { DailyHealth, nextResetAt, normalizeState } from './lib/health.js'
 import { Concurrency, MAX_CONCURRENCY, concurrencyOf } from './lib/limits.js'
 import { TurnNotes } from './lib/notes.js'
+import { ensureBillingAttribution, releaseBillingAttribution } from './lib/billing-attribution.js'
 import { JsonFile, dataDir, removeFile } from './lib/store.js'
 import { rejectionFor } from './lib/trust.js'
 
@@ -260,6 +261,9 @@ export function normalizeSettings(raw) {
       ? Math.min(source.limitCooldownSec, MAX_LIMIT_COOLDOWN_SEC)
       : DEFAULT_SETTINGS.limitCooldownSec
 
+  // 默认开：老配置文件里没有这个键，读出来就该是「按真实模型计费」。
+  const billByRealModel = source.billByRealModel !== false
+
   return {
     enabled: source.enabled !== false,
     bootstrapped: source.bootstrapped === true,
@@ -283,6 +287,7 @@ export function normalizeSettings(raw) {
     idleTimeoutSec,
     cooldownSec,
     limitCooldownSec,
+    billByRealModel,
     keepEventLog: source.keepEventLog !== false,
     eventLogLimit,
     // 会话页「隔离队列」显示谁：子智能体的会话默认不显示（那是委托出去的一次
@@ -457,6 +462,56 @@ export function apply(ctx, _config) {
   // ── 注册路由：这就是用户在模型选择器里看到的那个「模型」 ──────────────────
   const registration = ctx.llm.registerAdapter([ROUTE], adapter)
   logger.info?.(`model-failover: 路由 ${ROUTE} 已注册（模型选择器里的「${ROUTE_LABEL}」）`)
+
+  // ── 让账单按真实模型记，而不是按「模型接力」这个名字 ─────────────────────
+  //
+  // 做法与理由见 lib/billing-attribution.js 的文件头：包一层 dsh-cost-meter 的
+  // `createScope`，让外层（路由名）不记账、内层（真实候选）自成一次独立调用。
+  //
+  // 时机是个问题：那个桥对象是 dsh-cost-meter 在它自己 `apply()` 里挂到
+  // `globalThis` 上的，谁先加载取决于插件顺序。所以装不上不算错 —— 先记一笔
+  // 日志，然后隔一小会儿重试几次（都在毫秒级，对启动没有任何压力），十几秒
+  // 之后还装不上就放弃：那说明这个进程里根本没装 dsh-cost-meter。
+  let stopBillingRetry
+  try {
+    /** 重试的间隔（毫秒）。最后一档落在 8 秒后，合计八次尝试。 */
+    const RETRY_DELAYS = [200, 300, 500, 1_000, 2_000, 4_000]
+    /** 已经排出去第几档延迟 —— 只用来取下一档，不参与「装成功没有」的判断。 */
+    let pending = 0
+    const attempt = () => {
+      const result = ensureBillingAttribution(ROUTE, { enabled: () => settingsFile.get().billByRealModel !== false })
+      if (result.ok) {
+        if (result.reason === 'installed') {
+          logger.info?.('model-failover: 计费已按真实调用的模型归属（不再记在「模型接力」名下）')
+        }
+        return true
+      }
+      return false
+    }
+    if (!attempt()) {
+      let timer
+      const tick = () => {
+        if (attempt()) {
+          stopBillingRetry = undefined
+          return
+        }
+        if (pending >= RETRY_DELAYS.length) {
+          logger.warn?.('model-failover: 没找到 dsh-cost-meter 的计费桥，账单仍会记在「模型接力」名下（装了它之后重启即可）')
+          stopBillingRetry = undefined
+          return
+        }
+        timer = setTimeout(tick, RETRY_DELAYS[pending])
+        timer?.unref?.()
+        pending += 1
+      }
+      timer = setTimeout(tick, RETRY_DELAYS[pending])
+      timer?.unref?.()
+      pending += 1
+      stopBillingRetry = () => clearTimeout(timer)
+    }
+  } catch (error) {
+    logger.warn?.(`model-failover: 接管计费归属失败（账单会退回记在「模型接力」名下）— ${String(error?.message ?? error)}`)
+  }
 
   // ── 告诉模型设置页这条路由是可配置的 ─────────────────────────────────────
   // 纯尽力而为：老版本没有这个方法，或者本进程没有设置页，都不影响接力。
@@ -750,6 +805,7 @@ export function apply(ctx, _config) {
     if ('idleTimeoutSec' in patch) next.idleTimeoutSec = patch.idleTimeoutSec
     if ('cooldownSec' in patch) next.cooldownSec = patch.cooldownSec
     if ('limitCooldownSec' in patch) next.limitCooldownSec = patch.limitCooldownSec
+    if ('billByRealModel' in patch) next.billByRealModel = patch.billByRealModel !== false
     if ('keepEventLog' in patch) next.keepEventLog = patch.keepEventLog !== false
     if ('eventLogLimit' in patch) next.eventLogLimit = patch.eventLogLimit
     if ('showSubagentSessions' in patch) next.showSubagentSessions = patch.showSubagentSessions === true
@@ -1114,6 +1170,14 @@ export function apply(ctx, _config) {
       stateFile.dispose()
       logFile.dispose()
       cacheFile.dispose()
+      // 包在别人对象上的补丁要能收回：cost-meter 是常驻插件，不该在本插件卸载
+      // 之后还留着一个已经没人在维护的壳。
+      stopBillingRetry?.()
+      try {
+        releaseBillingAttribution()
+      } catch {
+        /* 桥已经不在了，那也没有可还原的东西 */
+      }
       try {
         registration?.()
       } catch {

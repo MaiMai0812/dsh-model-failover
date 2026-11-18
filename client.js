@@ -306,6 +306,9 @@ window.__ModuleLoader__.load({
         optLimitCooldownHint:
           '设了并发上限的模型，占着名额的会话交还之后先歇这么多秒再接别的会话。上游那边的连接/配额通常比本地慢半拍 —— 本地一放手就立刻塞下一个请求进去，很容易撞出个跟模型质量毫无关系的 429。只影响填了并发上限的候选；交还名额的那个会话自己回来时不歇。0 = 不歇。',
         optLimitCooldownUnit: '秒',
+        optBillRealModel: '按真正跑的那个模型记账',
+        optBillRealModelHint:
+          '本插件是包装路由：宿主发起的调用叫「模型接力」，真正跑的是队列里的某个候选。打开这一项，账单会记在那个候选自己的名字和价格上，而不是全都算在「模型接力」名下。需要装 dsh-cost-meter；装了她却没生效时重启一次 DSH。关掉就回到旧行为。',
         optAllQuarantined: '全部被隔离时仍然按顺序试一遍',
         optAllQuarantinedHint: '关掉后队列里全是隔离模型时会直接报错，不再尝试。',
         optKeepLog: '记录事件日志',
@@ -520,6 +523,9 @@ window.__ModuleLoader__.load({
         optLimitCooldownHint:
           'For models with a concurrency limit: after the last conversation using it finishes, wait this long before letting the next one in. The upstream usually frees its connections/quota a moment after the local side lets go, and pushing the next request straight in tends to produce a 429 that has nothing to do with model quality. Only affects candidates with a concurrency limit. 0 = no rest.',
         optLimitCooldownUnit: 'sec',
+        optBillRealModel: 'Bill the model that actually ran',
+        optBillRealModelHint:
+          'This plugin is a wrapping route: the host calls "Model Relay", but the real request goes to one of the queued candidates. With this on, the bill lands on that candidate\'s own name and price instead of all being counted under "Model Relay". Needs dsh-cost-meter; if it is installed and this still does not take effect, restart DSH once. Turned off, billing goes back to the old behaviour.',
         optAllQuarantined: 'Still try the queue when all are quarantined',
         optAllQuarantinedHint: 'Turned off, an all-quarantined queue fails immediately.',
         optKeepLog: 'Keep an event log',
@@ -1910,6 +1916,15 @@ window.__ModuleLoader__.load({
               }),
               span({ className: 'mf-note' }, t('optLimitCooldownUnit')),
             ),
+            // 计费归属：它是「这条路由在账单上叫什么名字」的开关，跟限流/隔离一样
+            // 属于「模型出了状况时怎么办」这一组，所以摆在模型异常卡片里。
+            h(ToggleRow, {
+              label: t('optBillRealModel'),
+              hint: t('optBillRealModelHint'),
+              checked: settings.billByRealModel !== false,
+              disabled: busy,
+              onChange: (value) => void run('/settings', { billByRealModel: value }),
+            }),
             h(ToggleRow, {
               label: t('optAllQuarantined'),
               hint: t('optAllQuarantinedHint'),

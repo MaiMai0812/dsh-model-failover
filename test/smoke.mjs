@@ -30,6 +30,7 @@ const { DEFAULT_SETTINGS, ROUTE, routeKey } = await import('../lib/constants.js'
 const { TurnNotes } = await import('../lib/notes.js')
 const { Cooldowns } = await import('../lib/cooldown.js')
 const { Concurrency, concurrencyOf, MAX_CONCURRENCY } = await import('../lib/limits.js')
+const { ensureBillingAttribution, releaseBillingAttribution } = await import('../lib/billing-attribution.js')
 
 // ── 假的宿主 ────────────────────────────────────────────────────────────────
 
@@ -2122,6 +2123,249 @@ await check('并发收工冷却：设置成 0 就完全不歇', async () => {
   assert.equal(textOf(chunks), 'alpha 说话')
 })
 
+/**
+ * 先把这个会话的隔离名单摆好，再开跑。
+ *
+ * 顺序很重要：健康表是「按逻辑日对齐」的，第一次访问当天状态时会把整份文件
+ * 换成新的一天（`#aligned`）。先 `markBroken` 再对齐，那条记录会被当成昨天的
+ * 东西一起扔掉 —— 用例会莫名其妙看到「隔离了却照样用它」。
+ */
+const quarantineFor = (h, key, sessionId = 's1', message = `${key} 挂了`) => {
+  h.health.snapshot(h.clock.ms, h.settings.get().resetHour, sessionId, 'default')
+  h.health.markBroken(key, { code: 'SERVER', message, at: h.clock.ms, sessionId })
+}
+
+await check('取消隔离：把排在前面、更好的模型放回来之后，下一趟就回到它', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one', concurrency: 1 },
+      { provider: 'beta', model: 'one', concurrency: 1 },
+    ],
+    scripts: new Map([[alphaKey, ok('alpha 说话')], [betaKey, ok('beta 顶班')]]),
+  })
+  // alpha 今天撞过墙，于是这个会话临时用了排在后面的 beta（它也有上限，所以
+  // 座位是真的钉在 beta 上 —— 这正是「临时顶班」留下的痕迹）。
+  quarantineFor(h, alphaKey)
+  const first = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [betaKey], 'alpha 隔离着，这一趟只能用 beta')
+  assert.equal(textOf(first), 'beta 顶班')
+  assert.equal(h.limits.pinnedKey('s1'), betaKey, 'beta 设了上限，这一趟把它钉住了')
+
+  // 用户跑到隔离区，把 alpha 那一条划掉 —— 用户原话：「我取消了某几个模型的隔离」。
+  h.clock.ms += 1_000
+  const cleared = h.health.clearRecord(h.clock.ms, 1, {
+    sessionId: 's1',
+    templateId: 'default',
+    key: alphaKey,
+    kind: 'quarantine',
+  })
+  assert.equal(cleared, true, '那条隔离记录该真的被删掉')
+  h.llm.calls.length = 0
+
+  const second = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey], `正主回来了就该回到队首，而不是继续用 beta：${JSON.stringify(commands(h.llm))}`)
+  assert.equal(textOf(second), 'alpha 说话')
+  assert.equal(h.limits.pinnedKey('s1'), alphaKey, '座位也要跟着换到它身上')
+  assert.equal(h.limits.holds(betaKey, 's1'), false, '顶班腾出来的座位要还回去，别让它白占一格')
+})
+
+await check('取消隔离：等当前这个模型说完再换，不是说到一半就抽走', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  let h
+  const scripts = new Map([
+    // beta 顶班这一趟跑着的时候，用户去把 alpha 放了回来 —— 这一趟必须让它写完。
+    [betaKey, async function* () {
+      h.health.clearRecord(h.clock.ms, 1, {
+        sessionId: 's1', templateId: 'default', key: alphaKey, kind: 'quarantine',
+      })
+      yield { type: 'block-start', index: 0, blockType: 'text' }
+      yield { type: 'text-delta', index: 0, text: 'beta 说完整了' }
+      yield { type: 'finish', reason: { kind: 'stop' } }
+    }],
+    [alphaKey, ok('alpha 说话')],
+  ])
+  h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one', concurrency: 1 },
+      { provider: 'beta', model: 'one', concurrency: 1 },
+    ],
+    scripts,
+  })
+  quarantineFor(h, alphaKey)
+
+  const first = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [betaKey], '这一趟途中不许换人')
+  assert.equal(textOf(first), 'beta 说完整了')
+
+  h.llm.calls.length = 0
+  const second = await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey], '下一趟才开始用回 alpha')
+})
+
+await check('取消隔离：划掉的是排在后面的记录，不该把正在用的模型顶掉', async () => {
+  const frontKey = routeKey('alpha', 'two')
+  const pinnedKey = routeKey('beta', 'one')
+  const behindKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [
+      { provider: 'alpha', model: 'two', concurrency: 1 },
+      { provider: 'beta', model: 'one', concurrency: 1 },
+      { provider: 'alpha', model: 'one', concurrency: 1 },
+    ],
+    scripts: new Map([[frontKey, ok('前面的说话')], [pinnedKey, ok('顶班说话')], [behindKey, ok('后面的说话')]]),
+  })
+  quarantineFor(h, frontKey, 's1', '前面的挂了')
+  quarantineFor(h, behindKey, 's1', '后面的也挂了')
+  await drain(runS1(h))
+  assert.equal(h.limits.pinnedKey('s1'), pinnedKey, '只剩它可用，座位钉在它身上')
+
+  // 划掉的是**排在后面**的那条：用户没把更好的模型放回来，就不该换人。
+  h.clock.ms += 1_000
+  h.health.clearRecord(h.clock.ms, 1, { sessionId: 's1', templateId: 'default', key: behindKey, kind: 'quarantine' })
+  h.llm.calls.length = 0
+  await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [pinnedKey], `排在后面被放回来不该抢走正在用的那个：${JSON.stringify(commands(h.llm))}`)
+})
+
+await check('取消隔离：顶班的没设并发上限时，本来就没有租约可谈，队列每趟自己重算', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const betaKey = routeKey('beta', 'one')
+  const h = await harness({
+    // beta 不设上限 —— 它只是「临时用一下」，没有任何座位。
+    order: [{ provider: 'alpha', model: 'one', concurrency: 1 }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([[alphaKey, ok('alpha 说话')], [betaKey, ok('beta 顶班')]]),
+  })
+  quarantineFor(h, alphaKey)
+  await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [betaKey])
+  assert.equal(h.limits.pinnedKey('s1'), undefined, '没上限就没有座位')
+
+  h.clock.ms += 1_000
+  h.health.clearRecord(h.clock.ms, 1, { sessionId: 's1', templateId: 'default', key: alphaKey, kind: 'quarantine' })
+  h.llm.calls.length = 0
+  await drain(runS1(h))
+  assert.deepEqual(commands(h.llm), [alphaKey], '队列每趟按隔离名单重算，放回来就到队首')
+})
+
+await check('计费归属：外层不再记路由名，真实模型自己落一笔', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+  /** 假的 cost-meter 桥：只记「谁建了 scope」，`finish` 一律说「没覆盖」。 */
+  const scopes = []
+  const makeScope = (options) => {
+    scopes.push(`${options?.provider}/${options?.model}`)
+    return { run: (operation) => operation(), observe: () => {}, finish: async () => false }
+  }
+  const bridge = { createScope: (options) => makeScope(options) }
+  globalThis[BRIDGE_KEY] = bridge
+  try {
+    assert.equal(ensureBillingAttribution(ROUTE, { enabled: () => true }).ok, true)
+    const h = await harness({
+      order: [{ provider: 'alpha', model: 'one' }],
+      scripts: new Map([[alphaKey, ok('真名说话')]]),
+    })
+    // 假装自己是 cost-meter：顶层调用先建一个 scope，然后每一次 `next()` 都包在
+    // `proxy.run(…)` 里 —— 这正是 `billing-stream.js` 的循环。
+    const outer = bridge.createScope({ provider: ROUTE, model: 'default', sessionId: 's1' }, 1_000)
+    assert.deepEqual(scopes, [], '外层是本路由，包装层不该给它建 scope')
+    // 内层真的往上打时，cost-meter 会以**候选的** provider/model 再建一个。
+    const realStream = h.llm.stream
+    h.llm.stream = (options) => {
+      bridge.createScope(options, 1_001)
+      return realStream.call(h.llm, options)
+    }
+
+    const chunks = []
+    const iterator = h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑')], sessionId: 's1' })[Symbol.asyncIterator]()
+    for (;;) {
+      const row = await outer.run(() => iterator.next())
+      if (row.done === true) break
+      chunks.push(row.value)
+    }
+
+    assert.equal(textOf(chunks), '真名说话', '内容照旧要交出来')
+    // 外层的 scope 根本不该建 —— 它一建，cost-meter 就会拿路由名记一笔。
+    assert.deepEqual(scopes, ['alpha/one'], `只有真实模型该建 scope：${JSON.stringify(scopes)}`)
+    assert.equal(await outer.finish(), true, '外层该说「已经覆盖」，否则 cost-meter 会拿路由名再记一遍')
+  } finally {
+    releaseBillingAttribution()
+    delete globalThis[BRIDGE_KEY]
+  }
+})
+
+await check('计费归属：关掉开关、或者根本没有桥，就完全退回原来的行为', async () => {
+  const alphaKey = routeKey('alpha', 'one')
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+
+  // 没有桥（没装 dsh-cost-meter）：装不上，也不能炸。
+  delete globalThis[BRIDGE_KEY]
+  const absent = ensureBillingAttribution(ROUTE, { enabled: () => true })
+  assert.equal(absent.ok, false)
+  assert.equal(absent.reason, 'no-bridge')
+  assert.equal(releaseBillingAttribution(), false, '没装过就没什么可还原的')
+
+  // 有桥但用户关掉了开关：外层照旧建 scope，记账回到路由名。
+  const scopes = []
+  const bridge = {
+    createScope: (options) => {
+      scopes.push(`${options?.provider}/${options?.model}`)
+      return { run: (operation) => operation(), observe: () => {}, finish: async () => false }
+    },
+  }
+  globalThis[BRIDGE_KEY] = bridge
+  try {
+    assert.equal(ensureBillingAttribution(ROUTE, { enabled: () => false }).ok, true)
+    const h = await harness({
+      order: [{ provider: 'alpha', model: 'one' }],
+      scripts: new Map([[alphaKey, ok('谁都没记住我')]]),
+    })
+    const realStream = h.llm.stream
+    h.llm.stream = (options) => {
+      bridge.createScope(options, 1_002)
+      return realStream.call(h.llm, options)
+    }
+    const outer = bridge.createScope({ provider: ROUTE, model: 'default', sessionId: 's1' }, 1_000)
+    assert.deepEqual(scopes, ['model-failover/default'], '关掉时外层要照旧建 scope')
+    const iterator = h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑')], sessionId: 's1' })[Symbol.asyncIterator]()
+    for (;;) {
+      const row = await outer.run(() => iterator.next())
+      if (row.done === true) break
+    }
+    assert.equal(await outer.finish(), false, '关掉时不该冒认「已覆盖」')
+    assert.deepEqual(scopes, ['model-failover/default', 'alpha/one'], '内层照旧被当成嵌套，自己不再建 scope')
+  } finally {
+    releaseBillingAttribution()
+    delete globalThis[BRIDGE_KEY]
+  }
+})
+
+await check('计费归属：重复装、卸载后还原，桥对象上不留多余的键', async () => {
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+  const calls = []
+  const original = (options) => {
+    calls.push(options?.provider)
+    return { run: (operation) => operation(), observe: () => {}, finish: async () => false }
+  }
+  const bridge = { createScope: original }
+  globalThis[BRIDGE_KEY] = bridge
+  try {
+    assert.equal(ensureBillingAttribution(ROUTE, {}).ok, true)
+    const wrapped = bridge.createScope
+    assert.notEqual(wrapped, original, '真的包上了')
+    assert.equal(ensureBillingAttribution(ROUTE, {}).reason, 'already', '再装一次不该叠第二层')
+    assert.equal(bridge.createScope, wrapped, '还是同一个包装')
+
+    assert.equal(releaseBillingAttribution(), true)
+    assert.equal(bridge.createScope, original, '卸载要把原来的函数放回去')
+    assert.equal(releaseBillingAttribution(), false, '卸载两次不该出问题')
+  } finally {
+    delete globalThis[BRIDGE_KEY]
+  }
+})
+
 await check('红绿计数：失败一次记一次、成功一次记一次，跨会话合计', async () => {
   const alphaKey = routeKey('alpha', 'one')
   const scripts = new Map([[alphaKey, quota('额度没了')]])
@@ -2214,6 +2458,12 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
   const freshHome = mkdtempSync(join(tmpdir(), 'model-failover-host-'))
   const previous = process.env.DSH_HOME
   process.env.DSH_HOME = freshHome
+  // cost-meter 的计费桥：声明在 try 外面，`finally` 里还要用它收摊。
+  const BRIDGE_KEY = Symbol.for('dsh-cost-meter.billion-context.v1')
+  const originalCreateScope = () => ({
+    run: (operation) => operation(), observe: () => {}, finish: async () => false,
+  })
+  const bridge = { createScope: originalCreateScope }
   try {
     const scripts = new Map([[routeKey('alpha', 'one'), ok('hi')]])
     const llm = createLlm(scripts)
@@ -2265,7 +2515,18 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(mod.name, 'model-failover')
     assert.deepEqual(mod.inject, ['llm'])
 
+    // cost-meter 的计费桥：apply() 一跑起来就该被包上（宿主真实环境下它也可能
+    // 比本插件后加载，那条路径由重试兜着，这里只验「装上」与「卸掉还原」）。
+    globalThis[BRIDGE_KEY] = bridge
+
     mod.apply(ctx, {})
+
+    assert.notEqual(bridge.createScope, originalCreateScope, 'apply 之后计费桥该被包一层')
+    const routed = bridge.createScope({ provider: ROUTE, model: 'default', sessionId: 's1' }, 1_000)
+    assert.equal(await routed.finish(), false, '这一轮还没见过真实模型，不许冒认「已覆盖」')
+    const plain = bridge.createScope({ provider: 'alpha', model: 'one', sessionId: 's1' }, 1_000)
+    assert.equal(typeof plain.run, 'function', '别的路由照旧走原实现')
+    assert.equal(await plain.finish(), false)
 
     assert.equal(registrations.length, 1, '应注册恰好一条路由')
     assert.deepEqual(registrations[0].providers, [ROUTE])
@@ -2365,6 +2626,15 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(negative.json.settings.limitCooldownSec, 5, '负数回落到默认值')
     // 后面几条用例都按「默认 5 秒」走，收尾改回来。
     await call('POST', '/api/dsh-model-failover/settings', { limitCooldownSec: 5 })
+
+    // 计费按真实模型：默认开，关掉能存住，写别的真值不要被当成「开」蒙混过去。
+    assert.equal(state.json.settings.billByRealModel, true, '老配置里没这个键，读出来也该是开的')
+    const billingOff = await call('POST', '/api/dsh-model-failover/settings', { billByRealModel: false })
+    assert.equal(billingOff.json.settings.billByRealModel, false, '关掉要真的落到设置里')
+    const billingBack = await call('GET', '/api/dsh-model-failover/state')
+    assert.equal(billingBack.json.settings.billByRealModel, false, '再读一次还是它')
+    const billingOn = await call('POST', '/api/dsh-model-failover/settings', { billByRealModel: true })
+    assert.equal(billingOn.json.settings.billByRealModel, true, '再打开也要存住')
 
     // 隔离名单 + 解除
     const quarantined = await call('POST', '/api/dsh-model-failover/reset', {})
@@ -2724,7 +2994,10 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     for (const dispose of disposers.reverse()) {
       if (typeof dispose === 'function') dispose()
     }
+    // 包在别人对象上的补丁要收回去：卸载之后不该留下一个没人维护的壳。
+    assert.equal(bridge.createScope, originalCreateScope, '卸载要把计费桥还原')
   } finally {
+    delete globalThis[BRIDGE_KEY]
     process.env.DSH_HOME = previous
     rmSync(freshHome, { recursive: true, force: true })
   }

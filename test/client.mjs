@@ -322,6 +322,8 @@ const initialState = () => ({
     cooldownSec: 60,
     // 并发上限的收工冷却：默认 5 秒（产品默认值，用例里就当宿主原样给的）。
     limitCooldownSec: 5,
+    // 计费按真实模型：默认开。
+    billByRealModel: true,
     continueText: '继续',
     hiddenProviders: ['qodercn'],
     retryWhenAllQuarantined: true,
@@ -1976,7 +1978,7 @@ globalThis.fetch = async (url, init = {}) => {
         }))
       }
       if (typeof body.editedTemplate === 'string') current.settings.editedTemplate = body.editedTemplate
-      for (const key of ['enabled', 'retrySameModelOnce', 'sameModelRetries', 'idleTimeoutSec', 'cooldownSec', 'limitCooldownSec', 'continueText', 'resetHour', 'keepEventLog', 'eventLogLimit', 'retryWhenAllQuarantined', 'autoContinue', 'autoContinueOnFailure', 'autoContinueOnMaxTokens', 'autoContinueFailureLimit', 'autoContinueMaxTokensLimit', 'continueDelaySec', 'showSubagentSessions', 'showForeignSessions']) {
+      for (const key of ['enabled', 'retrySameModelOnce', 'sameModelRetries', 'idleTimeoutSec', 'cooldownSec', 'limitCooldownSec', 'billByRealModel', 'continueText', 'resetHour', 'keepEventLog', 'eventLogLimit', 'retryWhenAllQuarantined', 'autoContinue', 'autoContinueOnFailure', 'autoContinueOnMaxTokens', 'autoContinueFailureLimit', 'autoContinueMaxTokensLimit', 'continueDelaySec', 'showSubagentSessions', 'showForeignSessions']) {
         if (body[key] !== undefined) current.settings[key] = body[key]
       }
       if (Array.isArray(body.hiddenProviders)) {
@@ -3515,6 +3517,25 @@ await check('并发收工冷却：设置页有这一行，显示宿主的值，�
   await runtime.mount(page(props))
   coolInput().props.onBlur()
   await runtime.mount(page(props))
+})
+
+await check('计费按真实模型：设置页有一颗开关，默认开着，点一下提交布尔值', async () => {
+  const toggle = () => runtime.find((node) => node.props['aria-label'] === 'optBillRealModel')
+  assert.equal(toggle().props['aria-pressed'], 'true', '默认开 —— 老配置里没这个键也该是开的')
+
+  const before = requests.length
+  await toggle().props.onClick()
+  await runtime.mount(page(props))
+  const posts = requests.slice(before).filter((row) => row.method === 'POST')
+  assert.deepEqual(posts.map((row) => row.body), [{ billByRealModel: false }])
+  assert.equal(toggle().props['aria-pressed'], 'false', '关掉之后开关要跟着变')
+
+  // 再点回来，后面的用例（以及默认值）仍按「开」走。
+  const back = requests.length
+  await toggle().props.onClick()
+  await runtime.mount(page(props))
+  const backPosts = requests.slice(back).filter((row) => row.method === 'POST')
+  assert.deepEqual(backPosts.map((row) => row.body), [{ billByRealModel: true }])
 })
 
 await check('并发收工冷却：正在歇的候选在队列行上写明还要歇几秒，也不当「下一个」', async () => {
