@@ -2158,6 +2158,172 @@ await check('并发上限：清空就表示不限制，这一项不再带 concur
   )
 })
 
+// ── 添加模型：搜索框 + 筛过的清单（原来是原生下拉框） ─────────────────────────
+//
+// 线上一条队列能扫出上百个候选，原生 `<select>` 只能靠滚动条一行行找。改成
+// 「上面一个搜索框、下面一列可点的行」之后，这几条用例盯的就是那三件事：
+// 只列关键字命中的、点一下真的加进去、搜不到时说清是搜的字不是目录空。
+
+const addItems = (rt) => rt.nodes.filter((node) => node.props?.['data-role'] === 'add-item')
+const addSearchBox = (rt) => rt.nodes.find((node) => node.props?.['data-role'] === 'add-search')
+const addKeys = (rt) => addItems(rt).map((node) => node.props['data-key'])
+
+/** 往 fixture 的目录里再塞几行，好让「搜得出来 / 搜不出来」有得比。 */
+const catalogWith = (...extra) => {
+  const state = initialState()
+  state.catalog = [...state.catalog, ...extra]
+  return state
+}
+const DELTA_FOUR = {
+  provider: 'delta', providerName: '未来枢纽', model: 'four', name: 'Delta Four', description: '',
+  efforts: [], effortsKnown: true,
+}
+
+await check('添加模型：画成一列可点的行，不再是原生下拉框，已在队列里的不列', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => payloadResponse(catalogWith(DELTA_FOUR))
+  let nodes
+  try {
+    await fresh.mount(page(props))
+    nodes = fresh.nodes
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(
+    nodes.filter((node) => node.tag === 'select' && node.props.className === 'mf-select').length,
+    0,
+    '原生下拉框该撤掉了',
+  )
+  // alpha/beta/gamma 已经在队列里，只剩 delta 那两行。
+  assert.deepEqual(addKeys({ nodes }).sort(), [KEY('delta', 'four'), KEY('delta', 'three')].sort(), '只列还没进队列的')
+  assert.equal(addItems({ nodes }).every((node) => node.tag === 'button'), true, '每一行本身就是一颗按钮')
+  // 分组标题用 provider 的中文名；模型名与模型 id 都要摆出来（id 是抄来用的）。
+  const flat = fresh.text(await fresh.mount(page(props)))
+  assert.ok(flat.includes('未来枢纽'), '分组标题应是 provider 的名字')
+  assert.ok(flat.includes('Delta Three'), '模型名要看得见')
+  assert.ok(flat.includes('three'), '模型 id 也要看得见')
+})
+
+await check('添加模型：搜索框只留名字里带关键字的，大小写不敏感，模型 id 与路由名也认', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => payloadResponse(catalogWith(DELTA_FOUR))
+  const type = async (value) => {
+    addSearchBox(fresh).props.onChange({ target: { value } })
+    await fresh.mount(page(props))
+  }
+  try {
+    await fresh.mount(page(props))
+    assert.equal(addSearchBox(fresh).props.type, 'search', '用 search 类型，浏览器自带清空按钮')
+    assert.equal(addSearchBox(fresh).props.value, '', '一开始是空的：全都列')
+
+    await type('FOUR')
+    assert.deepEqual(addKeys(fresh), [KEY('delta', 'four')], '大小写不敏感，只留命中的那一行')
+
+    await type('three')
+    assert.deepEqual(addKeys(fresh), [KEY('delta', 'three')], '模型 id 也要搜得到')
+
+    await type('未来枢纽')
+    assert.equal(addKeys(fresh).length, 2, '路由的中文名也要搜得到')
+
+    // 清空搜索（那颗 ✕）之后又该全列。
+    const clear = fresh.nodes.find((node) => node.props?.['data-role'] === 'add-search-clear')
+    assert.ok(clear, '有字的时候才出现清空按钮')
+    clear.props.onClick()
+    await fresh.mount(page(props))
+    assert.equal(addKeys(fresh).length, 2, '清空之后回到全列')
+    assert.equal(addSearchBox(fresh).props.value, '', '搜索框也跟着清空')
+  } finally {
+    globalThis.fetch = saved
+  }
+})
+
+await check('添加模型：点一行就加进队列，POST 整份 order，并把搜索框清掉', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = catalogWith(DELTA_FOUR)
+  const seen = []
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method ?? 'GET'
+    const body = init.body === undefined ? undefined : JSON.parse(init.body)
+    seen.push({ url: String(url), method, body })
+    if (method === 'POST' && Array.isArray(body?.templates)) state.settings.templates = body.templates
+    return payloadResponse(state)
+  }
+  try {
+    await fresh.mount(page(props))
+    addSearchBox(fresh).props.onChange({ target: { value: 'four' } })
+    await fresh.mount(page(props))
+    await addItems(fresh)[0].props.onClick()
+    await fresh.mount(page(props))
+
+    const post = seen.filter((row) => row.method === 'POST' && row.url.endsWith('/settings'))
+    assert.equal(post.length, 1, '应只发一个 POST')
+    assert.deepEqual(post[0].body.templates[0].order, [
+      { provider: 'alpha', model: 'one' },
+      { provider: 'beta', model: 'one' },
+      { provider: 'gamma', model: 'two' },
+      { provider: 'delta', model: 'four' },
+    ], '新的一行追加在队尾，别人的键一个都不许多')
+    assert.equal(addSearchBox(fresh).props.value, '', '加完就清掉关键字：接着找下一个')
+    assert.equal(
+      addKeys(fresh).includes(KEY('delta', 'four')),
+      false,
+      '刚加进去的那一行不该还留在清单里',
+    )
+  } finally {
+    globalThis.fetch = saved
+  }
+})
+
+await check('添加模型：一个都没搜到时说清是搜的字，不是目录空', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  globalThis.fetch = async () => payloadResponse(catalogWith(DELTA_FOUR))
+  let flat
+  let empty
+  try {
+    // 这条要用真字典：`addNoMatch` 带一个 {query} 占位符，用 key 回声的 `props.t`
+    // 只会把占位符原样吐出来，看不出「搜的字有没有被带进去」。
+    await fresh.mount(page({ close() {}, t }))
+    addSearchBox(fresh).props.onChange({ target: { value: '没有这个模型' } })
+    flat = fresh.text(await fresh.mount(page({ close() {}, t })))
+    empty = fresh.nodes.filter((node) => node.props?.['data-role'] === 'add-empty')
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(empty.length, 1, '搜不到时给一句说明，不是一片空白')
+  assert.ok(flat.includes('没有这个模型'), `要把搜的字原样报出来，实际：${flat.slice(0, 200)}`)
+  assert.equal(flat.includes('没有扫到可用的模型'), false, '目录不是空的，别报错成「没扫到模型」')
+})
+
+await check('添加模型：回车加第一个，搜到只剩一行时这是最短的路', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const state = catalogWith(DELTA_FOUR)
+  const seen = []
+  globalThis.fetch = async (url, init = {}) => {
+    const method = init.method ?? 'GET'
+    const body = init.body === undefined ? undefined : JSON.parse(init.body)
+    seen.push({ url: String(url), method, body })
+    if (method === 'POST' && Array.isArray(body?.templates)) state.settings.templates = body.templates
+    return payloadResponse(state)
+  }
+  try {
+    await fresh.mount(page(props))
+    addSearchBox(fresh).props.onChange({ target: { value: 'four' } })
+    await fresh.mount(page(props))
+    await addSearchBox(fresh).props.onKeyDown({ key: 'Enter' })
+    await fresh.mount(page(props))
+    const post = seen.filter((row) => row.method === 'POST' && row.url.endsWith('/settings'))
+    assert.equal(post.length, 1, '回车应直接把第一行加进去')
+    assert.deepEqual(post[0].body.templates[0].order.at(-1), { provider: 'delta', model: 'four' })
+  } finally {
+    globalThis.fetch = saved
+  }
+})
+
 const queueRows = () => runtime.nodes.filter((node) => node.props?.['data-role'] === 'queue-row')
 const dragEvent = (tagName = 'DIV') => ({
   target: { tagName },

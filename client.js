@@ -121,8 +121,7 @@ window.__ModuleLoader__.load({
 .mf-btn:disabled { opacity: .35; cursor: default; }
 .mf-btn.mf-icon { padding: 3px 7px; line-height: 1; }
 .mf-add { display: flex; gap: 8px; align-items: center; }
-.mf-select, .mf-effort, .mf-input, .mf-num { font: inherit; color: inherit; background: color-mix(in srgb, currentColor 5%, transparent); border: 1px solid color-mix(in srgb, currentColor 22%, transparent); border-radius: 7px; padding: 4px 8px; min-width: 0; }
-.mf-select { flex: 1; }
+.mf-effort, .mf-input, .mf-num { font: inherit; color: inherit; background: color-mix(in srgb, currentColor 5%, transparent); border: 1px solid color-mix(in srgb, currentColor 22%, transparent); border-radius: 7px; padding: 4px 8px; min-width: 0; }
 .mf-effort { flex: none; max-width: 150px; }
 .mf-effort-none { flex: none; opacity: .45; font-size: 11.5px; }
 /* 「用着几个/上限」小胶囊：占满了变红（那是它被跳过的原因）。 */
@@ -202,6 +201,25 @@ window.__ModuleLoader__.load({
    用「视觉隐藏」而不是 display:none：后者在部分浏览器里会让 label 的点击不再转发给
    file input，对话框根本弹不出来（测试里是直接调 onChange，查不出这种问题）。 */
 .mf-file { position: absolute; width: 1px; height: 1px; opacity: 0; overflow: hidden; clip: rect(0 0 0 0); }
+/* 从「已接入的模型」里挑人：上面一个搜索框，下面一份筛过的清单。
+   原来是个原生 <select>，模型一多就只能在滚动条里一行行找；现在敲几个字就
+   只剩几行。清单限高并且自己滚 —— 它再长也不该把整页往下推。 */
+.mf-picker { display: flex; flex-direction: column; gap: 6px; }
+.mf-picker-search { display: flex; align-items: center; gap: 6px; }
+/* 搜索框自己就带 flex: 1（见上面的 .mf-input）；右边那两样是 flex: none，
+   所以只有框会被拉长。 */
+.mf-picker-count { flex: none; opacity: .5; font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.mf-picker-list { max-height: 260px; overflow: auto; display: flex; flex-direction: column; gap: 8px; padding: 2px 0; }
+.mf-picker-group { display: flex; flex-direction: column; gap: 1px; }
+/* provider 那一行是分组标题，不是可点的东西 —— 所以它比清单行更淡、更小。 */
+.mf-picker-provider { font-size: 11px; opacity: .5; padding: 0 4px 2px; }
+/* 一行候选：整行就是按钮，点哪都算点它。悬停才浮出底色，平时不抢注意力。 */
+.mf-picker-item { display: flex; align-items: baseline; gap: 8px; width: 100%; font: inherit; color: inherit; text-align: left; background: transparent; border: 1px solid transparent; border-radius: 6px; padding: 3px 6px; cursor: pointer; }
+.mf-picker-item:hover:not(:disabled) { background: color-mix(in srgb, currentColor 7%, transparent); }
+.mf-picker-item:disabled { opacity: .45; cursor: default; }
+.mf-picker-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 模型 id：名字是给人看的，id 是抄来用的，两个都得能看见（也都能被搜到）。 */
+.mf-picker-id { flex: none; opacity: .45; font-size: 11px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 /* 被隐藏的路由：它们不在清单里，所以只能单独列出来让人撤销。 */
 .mf-hidden { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; }
 .mf-hidden-item { display: inline-flex; align-items: center; gap: 6px; padding: 1px 4px 1px 8px; border-radius: 999px; border: 1px dashed color-mix(in srgb, #e5484d 45%, transparent); font-size: 11.5px; }
@@ -283,8 +301,9 @@ window.__ModuleLoader__.load({
         windowHint:
           '覆盖值只对这一行生效：接力对外声明的是队首候选的窗口，每个候选按自己的窗口跑。压缩触发点 = 窗口 × 0.8（宿主默认比例）。',
         remove: '移出队列',
-        addModel: '从已接入的模型里添加…',
-        add: '添加',
+        addSearch: '搜模型：名字、模型 id 或者路由名都行',
+        addSearchClear: '清空搜索',
+        addNoMatch: '没有名字里带「{query}」的模型。',
         noModels: '没有扫到可用的模型。',
         relay: '模型异常',
         relayHint:
@@ -508,8 +527,9 @@ window.__ModuleLoader__.load({
         windowHint:
           'The override applies to this row only: the relay advertises the head candidate’s window, and each candidate runs at its own window. Compaction trigger = window × 0.8 (host default ratio).',
         remove: 'Remove',
-        addModel: 'Add a connected model…',
-        add: 'Add',
+        addSearch: 'Search models — name, model id, or route id',
+        addSearchClear: 'Clear the search',
+        addNoMatch: 'No model has “{query}” in its name.',
         noModels: 'No models were discovered.',
         relay: 'Model anomalies',
         relayHint:
@@ -1001,7 +1021,14 @@ window.__ModuleLoader__.load({
       const [error, setError] = useState('')
       const [notice, setNotice] = useState('')
       const [busy, setBusy] = useState(false)
-      const [addKey, setAddKey] = useState('')
+      /**
+       * 「添加模型」那个搜索框里的字。
+       *
+       * 它就是筛选条件，不是「选中的那一项」：清单里的行点一下就加进队列，
+       * 没有第二层的「先选中再按添加」。模型多的时候（线上一条队列能扫出上百
+       * 个候选）靠它把范围缩到能一眼看完的几行。
+       */
+      const [addQuery, setAddQuery] = useState('')
       /**
        * 这个面板是否还挂在页面上。
        *
@@ -1205,19 +1232,41 @@ window.__ModuleLoader__.load({
         return map
       }, [state])
 
-      /** 已接入但还没进队列的模型，按 provider 分组给下拉框用。 */
+      /**
+       * 已接入但还没进队列的模型 —— 按 provider 分组，并且按搜索框里那几个字筛过。
+       *
+       * 匹配范围是**四样**：模型名（`row.name`，用户看到的那个）、模型 id
+       * （`row.model`，从别处抄来的常常是这个）、provider 的中文名与它的路由 id。
+       * 只认模型名会让人搜 `deepseek` 却搜不到名字叫「DeepSeek-V4.1-Flash」
+       * 之外的那些别名，也会让「我明明记得路由叫 xjy」变成搜不到。
+       *
+       * 大小写不敏感、去掉首尾空格；空白查询就是「全都列」。
+       */
       const available = useMemo(() => {
         const inQueue = new Set(order.map((item) => keyOf(item.provider, item.model)))
+        const needle = addQuery.trim().toLowerCase()
         const groups = new Map()
         for (const row of state?.catalog ?? []) {
           const key = keyOf(row.provider, row.model)
           if (inQueue.has(key)) continue
+          if (needle !== '') {
+            const haystack = [row.name, row.model, row.providerName, row.provider]
+              .map((part) => String(part ?? '').toLowerCase())
+              .join('\n')
+            if (!haystack.includes(needle)) continue
+          }
           if (!groups.has(row.provider)) groups.set(row.provider, { provider: row.provider, name: row.providerName, rows: [] })
           groups.get(row.provider).rows.push({ key, model: row.model, label: row.name, description: row.description })
         }
         for (const group of groups.values()) group.rows.sort((a, b) => a.label.localeCompare(b.label))
         return [...groups.values()].sort((a, b) => a.name.localeCompare(b.name))
-      }, [state, order])
+      }, [state, order, addQuery])
+
+      /** 筛完之后还剩几个（界面上要报「N 个」，也让「一个都没剩」说得清楚）。 */
+      const availableCount = useMemo(
+        () => available.reduce((sum, group) => sum + group.rows.length, 0),
+        [available],
+      )
 
       const mutateOrder = useCallback((nextOrder) => {
         if (editedTemplate === undefined) return
@@ -1305,14 +1354,21 @@ window.__ModuleLoader__.load({
         mutateOrder(next)
       }, [order, mutateOrder, maxConcurrency])
 
-      const add = useCallback(() => {
-        if (addKey === '') return
-        const at = addKey.indexOf('\u0000')
-        const provider = addKey.slice(0, at)
-        const model = addKey.slice(at + 1)
-        setAddKey('')
+      /**
+       * 把搜索框里那一行加进队列。
+       *
+       * 行是 `provider\0model`（`keyOf` 的老口径），加完就清掉搜索框 —— 加完
+       * 一行接着找下一行是最常见的动作，留着旧关键字只会挡住别的候选。
+       */
+      const add = useCallback((key) => {
+        if (typeof key !== 'string' || key === '') return
+        const at = key.indexOf('\u0000')
+        if (at < 0) return
+        const provider = key.slice(0, at)
+        const model = key.slice(at + 1)
+        setAddQuery('')
         mutateOrder([...order, { provider, model }])
-      }, [addKey, order, mutateOrder])
+      }, [order, mutateOrder])
 
       /** 切到另一个模板编辑。只是界面状态，不影响任何会话实际用哪条队列。 */
       const selectTemplate = useCallback((id) => {
@@ -1964,19 +2020,70 @@ window.__ModuleLoader__.load({
               )
             }),
             order.length === 0 ? div({ className: 'mf-empty' }, t('queueEmpty')) : null,
-            div({ className: 'mf-add' },
-              h('select', {
-                className: 'mf-select',
-                value: addKey,
-                disabled: busy || available.length === 0,
-                onChange: (event) => setAddKey(event.target.value),
-              },
-                h('option', { value: '' }, available.length === 0 ? t('noModels') : t('addModel')),
-                ...available.map((group) => h('optgroup', { key: group.provider, label: group.name },
-                  ...group.rows.map((row) => h('option', { key: row.key, value: row.key }, `${row.label}  (${row.model})`)),
-                )),
+            // 从「已接入的模型」里加人：一个搜索框 + 一份筛过的清单。
+            //
+            // 原来这里是个原生 `<select>`，模型一多（线上一条队列能扫出上百个
+            // 候选）就只能靠滚动条一行行找，还得记住名字。改成搜索框之后，
+            // 敲几个字就只剩几行，点一下那一行就进队列 —— 没有「先选中再按添加」
+            // 这一层，因为那是同一个动作的两次点击。
+            div({ className: 'mf-picker' },
+              div({ className: 'mf-picker-search' },
+                h('input', {
+                  className: 'mf-input',
+                  type: 'search',
+                  'data-role': 'add-search',
+                  placeholder: t('addSearch'),
+                  value: addQuery,
+                  disabled: busy || (state?.catalog ?? []).length === 0,
+                  onChange: (event) => setAddQuery(event.target.value),
+                  onKeyDown: (event) => {
+                    // 回车加第一个：搜到只剩一行时，这是最短的路。
+                    if (event.key === 'Enter' && available.length > 0) {
+                      add(available[0].rows[0].key)
+                      return
+                    }
+                    if (event.key === 'Escape') setAddQuery('')
+                  },
+                }),
+                addQuery === ''
+                  ? null
+                  : h('button', {
+                      type: 'button',
+                      className: 'mf-btn mf-icon',
+                      'data-role': 'add-search-clear',
+                      title: t('addSearchClear'),
+                      disabled: busy,
+                      onClick: () => setAddQuery(''),
+                    }, '✕'),
+                availableCount === 0 ? null : span({ className: 'mf-picker-count' }, String(availableCount)),
               ),
-              h('button', { type: 'button', className: 'mf-btn', disabled: busy || addKey === '', onClick: add }, t('add')),
+              availableCount === 0
+                ? div({ className: 'mf-empty', 'data-role': 'add-empty' },
+                    (state?.catalog ?? []).length === 0
+                      ? t('noModels')
+                      : t('addNoMatch', { query: addQuery.trim() }))
+                : div({ className: 'mf-picker-list', 'data-role': 'add-list' },
+                    ...available.map((group) => div({ className: 'mf-picker-group', key: group.provider },
+                      div({ className: 'mf-picker-provider' }, group.name === '' ? group.provider : group.name),
+                      ...group.rows.map((row) => h('button', {
+                        type: 'button',
+                        className: 'mf-picker-item',
+                        key: row.key,
+                        'data-role': 'add-item',
+                        'data-key': row.key,
+                        title: `${row.label}  (${row.model})`,
+                        disabled: busy,
+                        onClick: () => add(row.key),
+                      },
+                        span({ className: 'mf-picker-name' }, row.label),
+                        // 模型 id 跟名字常常不是一回事（名字是给人看的），
+                        // 所以两个都摆出来 —— 搜索两样都能搜到。
+                        row.label === row.model
+                          ? null
+                          : span({ className: 'mf-picker-id' }, row.model),
+                      )),
+                    )),
+                  ),
             ),
             // 「加不了某个 provider 的模型」时，答案往往就在下面这一栏：整个
             // provider 被 hiddenProviders 藏了，清单里连一行都没有。放在下拉框
