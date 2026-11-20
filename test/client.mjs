@@ -2298,6 +2298,32 @@ await check('添加模型：一个都没搜到时说清是搜的字，不是目�
   assert.equal(flat.includes('没有扫到可用的模型'), false, '目录不是空的，别报错成「没扫到模型」')
 })
 
+await check('添加模型：能加的都加完了，就说「都在队列里了」，别报成搜不到', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 目录里就这几行，而且全在队列里 —— 清单必然空，但关键字也是空的。
+  const state = initialState()
+  state.settings.templates = [{
+    id: 'default',
+    name: '默认模板',
+    order: state.catalog.map((row) => ({ provider: row.provider, model: row.model })),
+  }]
+  globalThis.fetch = async () => payloadResponse(state)
+  let flat
+  let empty
+  try {
+    await fresh.mount(page({ close() {}, t }))
+    flat = fresh.text(await fresh.mount(page({ close() {}, t })))
+    empty = fresh.nodes.filter((node) => node.props?.['data-role'] === 'add-empty')
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(empty.length, 1, '全加完时仍要有话说，不能一片空白')
+  assert.ok(flat.includes('都已经在队列里了'), `该说「都在队列里了」，实际：${flat.slice(0, 200)}`)
+  assert.equal(flat.includes('没有名字里带'), false, '关键字是空的，别提「搜不到」')
+  assert.equal(addSearchBox(fresh).props.disabled, false, '搜索框照样能用（目录里有东西）')
+})
+
 await check('添加模型：回车加第一个，搜到只剩一行时这是最短的路', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch

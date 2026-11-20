@@ -304,6 +304,7 @@ window.__ModuleLoader__.load({
         addSearch: '搜模型：名字、模型 id 或者路由名都行',
         addSearchClear: '清空搜索',
         addNoMatch: '没有名字里带「{query}」的模型。',
+        addAllQueued: '能加的模型都已经在队列里了。',
         noModels: '没有扫到可用的模型。',
         relay: '模型异常',
         relayHint:
@@ -530,6 +531,7 @@ window.__ModuleLoader__.load({
         addSearch: 'Search models — name, model id, or route id',
         addSearchClear: 'Clear the search',
         addNoMatch: 'No model has “{query}” in its name.',
+        addAllQueued: 'Every model that can be added is already in the queue.',
         noModels: 'No models were discovered.',
         relay: 'Model anomalies',
         relayHint:
@@ -2061,7 +2063,12 @@ window.__ModuleLoader__.load({
                 ? div({ className: 'mf-empty', 'data-role': 'add-empty' },
                     (state?.catalog ?? []).length === 0
                       ? t('noModels')
-                      : t('addNoMatch', { query: addQuery.trim() }))
+                      // 目录里有东西、关键字也是空的，却一个都列不出来 —— 那只可能是
+                      // 全都已经在队列里了。这时说「没有名字里带『』的模型」只会让人
+                      // 以为搜索坏了。
+                      : (addQuery.trim() === ''
+                          ? t('addAllQueued')
+                          : t('addNoMatch', { query: addQuery.trim() })))
                 : div({ className: 'mf-picker-list', 'data-role': 'add-list' },
                     ...available.map((group) => div({ className: 'mf-picker-group', key: group.provider },
                       div({ className: 'mf-picker-provider' }, group.name === '' ? group.provider : group.name),
