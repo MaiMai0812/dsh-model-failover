@@ -345,6 +345,8 @@ window.__ModuleLoader__.load({
         trigError: '运行失败',
         evAutoContinueSkipped: '本轮是本机网络问题（{code}），没有补发「继续」',
         evCeilingRotate: '「{provider} · {model}」连着 {count} 次撞到输出上限，接着写的换成「{to}」',
+        evCeilingStreak: '「{provider} · {model}」连着 {count} 次撞到输出上限，这一轮写不完，今日隔离',
+        evOverflowRelay: '「{provider} · {model}」的窗口装不下这一轮，改交给窗口更大的「{to}」接着写',
         evSkip: '你跳过了「{provider} · {model}」，它今天不再进队',
         evSkipLive: '你跳过了「{provider} · {model}」，正在跑的这一趟已让位，接力接着往下走',
         count: '条',
@@ -568,6 +570,8 @@ window.__ModuleLoader__.load({
         trigError: 'failed',
         evAutoContinueSkipped: 'Local network problem ({code}) — no “continue” was sent',
         evCeilingRotate: '“{provider} · {model}” hit the output ceiling {count} times in a row — “{to}” takes over',
+        evCeilingStreak: '“{provider} · {model}” hit the output ceiling {count} times in a row and cannot finish this turn — quarantined today',
+        evOverflowRelay: '“{provider} · {model}” cannot hold this turn — “{to}” has a bigger window and takes over',
         evSkip: 'You skipped “{provider} · {model}” — it is out for today',
         evSkipLive: 'You skipped “{provider} · {model}” — the running attempt stepped aside and the queue carries on',
         count: 'entries',
@@ -943,6 +947,7 @@ window.__ModuleLoader__.load({
         MANUAL_SKIP: '手动跳过',
         TRANSPORT: '网络中断',
         CONTEXT_WINDOW_EXCEEDED: '上下文超长',
+        MAX_TOKENS_STREAK: '老是撞输出上限',
         ABORTED: '被中止',
       }
       return table[code] ?? ''
@@ -1628,6 +1633,25 @@ window.__ModuleLoader__.load({
               provider: event.provider,
               model: event.model,
               count: event.count ?? 0,
+              to: event.to ?? '?',
+            })
+            break
+          case 'ceiling-streak':
+            // 和 `ceiling-rotate` 是同一件事的两面：那一行说「换成谁了」，
+            // 这一行说「它为什么被挪走、并且今天不再回来」。用户看到隔离名单
+            // 里多出一条时，翻日志能对上号。
+            body = t('evCeilingStreak', {
+              provider: event.provider,
+              model: event.model,
+              count: event.count ?? 0,
+            })
+            break
+          case 'overflow-relay':
+            // 上下文装不下：换了个窗口更大的接着写。它**不是**隔离，
+            // 所以文案里不出现「隔离」两个字，免得用户以为这个模型坏了。
+            body = t('evOverflowRelay', {
+              provider: event.provider,
+              model: event.model,
               to: event.to ?? '?',
             })
             break

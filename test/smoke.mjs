@@ -460,6 +460,117 @@ await check('上下文超长：交给 agent loop 去压缩，不切换', async (
   assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0)
 })
 
+// 4b · 上下文装不下，但队里有窗口更大的：换过去接着写
+//
+// 用户 2026-11-20 的原话：「上下文容不下的错误之类，遇到这种错误也归到模型错误
+// 里去，自动接队列里下一个模型继续输出」。
+//
+// 「交给宿主压缩」只该是**最后一步**：压缩会砍掉上下文，之后这一轮的记忆就变了。
+// 队里明明有个装得下的模型，换过去就能一字不动地接着写，那才是用户要的接力。
+await check('上下文超长：队里有窗口更大的就换过去接着写，不交回宿主', async () => {
+  const h = await harness({
+    // 窗口从行上给：`#windowOf` 先认用户手填的，再问目录 —— 这也正是那个
+    // 字段存在的意义（小窗口模型换到大窗口模型，靠的就是它）。
+    order: [
+      { provider: 'alpha', model: 'one', contextWindow: 8192 },
+      { provider: 'beta', model: 'two', contextWindow: 200000 },
+    ],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), contextTooLong()],
+      [routeKey('beta', 'two'), ok('大窗口接着写完了')],
+    ]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'auto', messages: [user('写个长文')] }))
+
+  assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one'), routeKey('beta', 'two')], '小窗口撞墙就该换到大窗口')
+  assert.equal(textOf(chunks), '大窗口接着写完了', '换人之后要真的写出来')
+  assert.equal(finishOf(chunks)?.reason?.kind, 'stop', '这一轮应该是正常结束，不是把错抛回去')
+
+  // 它只是窗口小，不是「今天坏了」：隔离名单上一条都不许有。
+  assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0, '撞窗口不是模型坏了，不许隔离')
+
+  // 换人这件事要能在事件日志里看见 —— 否则用户只看到模型被莫名跳过。
+  const rows = h.events.filter((event) => event.kind === 'overflow-relay')
+  assert.equal(rows.length, 1, '换人时记一条')
+  assert.equal(rows[0].provider, 'alpha')
+  assert.equal(rows[0].model, 'one')
+  assert.equal(rows[0].to, 'beta/two')
+  assert.equal(rows[0].from, 8192)
+  assert.equal(rows[0].window, 200000)
+})
+
+await check('上下文超长：窗口一样大就不硬试，仍然交回宿主去压缩', async () => {
+  const h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one', contextWindow: 32000 },
+      { provider: 'beta', model: 'two', contextWindow: 32000 },
+      { provider: 'beta', model: 'one', contextWindow: 8000 },
+    ],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), contextTooLong()],
+      [routeKey('beta', 'two'), ok('不该出现')],
+      [routeKey('beta', 'one'), ok('也不该出现')],
+    ]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'auto', messages: [] }))
+
+  // 一样大的换过去只会把同一坨请求再撞一次墙；更小的更是往坑里跳。
+  assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one')], '窗口不更大就一个都别试')
+  assert.equal(finishOf(chunks)?.reason?.failure?.code, 'CONTEXT_WINDOW_EXCEEDED', '最后还是要交回宿主')
+  assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0, '不隔离任何人')
+})
+
+// 4c · 「body too large」单独出现，跟上下文无关
+//
+// 线上真实那条（codearts，2026-11-20）：凭证签名失败的 401 原话里带着
+// 「body too large」，被 `looksLikeContextOverflow` 判成了上下文超长 ——
+// 于是它绕开了隔离与换人，一整天都在同一个坏凭证上打转。
+await check('凭证 401 的原话里带「body too large」，不是上下文超长', async () => {
+  const codearts = () => failing(
+    'INVALID_CREDENTIAL',
+    'codearts: model request failed with HTTP 401: {"error_msg":"Incorrect IAM authentication information: calc ak sk signature fail:body too large","error_code":"APIG.0301"}',
+  )
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), codearts()],
+      [routeKey('beta', 'one'), ok('换个人就通了')],
+    ]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'auto', messages: [] }))
+
+  assert.equal(textOf(chunks), '换个人就通了', '这一轮应该由下一个模型写完')
+  assert.equal(finishOf(chunks)?.reason?.kind, 'stop', '不许把 401 当成「交给宿主压缩」')
+  // 三跳换人之前先原样重发两次（默认 sameModelRetries=2），然后轮到 beta。
+  assert.deepEqual(commands(h.llm), [
+    routeKey('alpha', 'one'), routeKey('alpha', 'one'), routeKey('alpha', 'one'),
+    routeKey('beta', 'one'),
+  ], '照常重发、照常换人，不该原地弹错')
+
+  const rows = h.health.view(h.clock.ms, 1).quarantined
+  assert.deepEqual(rows.map((row) => row.key), [routeKey('alpha', 'one')], '坏凭证要进隔离名单')
+  assert.equal(rows[0].code, 'INVALID_CREDENTIAL', '记的是它原来的码，不是被改判的超长')
+})
+
+await check('「body too large」和上下文一起说的时候，仍然算超长', async () => {
+  const oversize = () => failing('HTTP_413', 'upstream said: body too large for this context, reduce the tokens')
+  const h = await harness({
+    order: [
+      { provider: 'alpha', model: 'one', contextWindow: 8000 },
+      { provider: 'beta', model: 'two', contextWindow: 64000 },
+    ],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), oversize()],
+      [routeKey('beta', 'two'), ok('大窗口接着写')],
+    ]),
+  })
+  await drain(h.adapter.stream({ provider: ROUTE, model: 'auto', messages: [] }))
+  assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one'), routeKey('beta', 'two')], '该判成超长并换到大窗口')
+})
+
 // 5 · 当天隔离对后续任务生效
 await check('当天隔离：下一个任务不再从坏模型开始', async () => {
   const h = await harness({
@@ -718,6 +829,60 @@ await check('连着撞就往前挪一格：每个模型试两次，然后轮到�
     ],
     '每个模型连着试两次就该轮到下一个，转完一圈从头接上',
   )
+})
+
+await check('连着撞上限够了就进隔离区，下一趟直接从下一个模型开始', async () => {
+  // 用户 2026-11-20 的原话：「如果一个模型多次报输出已达上限的错，也把这个模型
+  // 放入隔离区，使用下一个模型」。光挪一格不够 —— 下一轮还会轮回来、再撞两下，
+  // 用户看到的是同一句半截话被反复截断。
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), truncatedSilent()],
+      [routeKey('beta', 'one'), ok('换我接着写')],
+    ]),
+  })
+  const opts = ceilingOpts('s-streak-quarantine')
+
+  await drain(h.adapter.stream(opts)) // 账 = 1
+  assert.equal(h.health.view(h.clock.ms, 1).quarantined.length, 0, '撞一次不算坏，不许隔离')
+  await drain(h.adapter.stream(opts)) // 账 = 2 → 攒够
+
+  const rows = h.health.view(h.clock.ms, 1).quarantined
+  assert.deepEqual(rows.map((row) => row.key), [routeKey('alpha', 'one')], '攒够次数就该躺进隔离名单')
+  assert.equal(rows[0].code, 'MAX_TOKENS_STREAK', '记的是「老是撞上限」，不是某个上游错误码')
+  assert.equal(rows[0].sessionId, 's-streak-quarantine', '隔离按会话算，不去影响别的会话')
+
+  // 事件日志里要能看出「为什么」：用户翻日志时该看到它是被截断太多次，
+  // 而不是某个上游报了错。
+  const streaks = h.events.filter((event) => event.kind === 'ceiling-streak')
+  assert.equal(streaks.length, 1, '攒够时记一条')
+  assert.equal(streaks[0].provider, 'alpha')
+  assert.equal(streaks[0].model, 'one')
+  assert.equal(streaks[0].count, 2)
+
+  // 下一趟真的从下一个模型开始 —— 这才是用户要的效果。
+  h.llm.calls.length = 0
+  const next = await drain(h.adapter.stream(ceilingOpts('s-streak-quarantine')))
+  assert.deepEqual(commands(h.llm), [routeKey('beta', 'one')], '隔离之后不该再轮回来')
+  assert.equal(textOf(next), '换我接着写')
+})
+
+await check('撞上限攒够的隔离不跨会话：别的会话照样从队首开始', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), truncatedSilent()],
+      [routeKey('beta', 'one'), ok('不该轮到我')],
+    ]),
+  })
+  const opts = ceilingOpts('s-streak-a')
+  await drain(h.adapter.stream(opts))
+  await drain(h.adapter.stream(opts)) // 攒够，alpha 在 s-streak-a 里被隔离
+
+  h.llm.calls.length = 0
+  await drain(h.adapter.stream(ceilingOpts('s-streak-b')))
+  assert.deepEqual(commands(h.llm), [routeKey('alpha', 'one')], '另一个会话里它没撞过墙，凭什么绕开它')
 })
 
 await check('连着撞上限时，占着的并发名额要跟着交还，否则轮换等于没发生', async () => {
