@@ -3865,6 +3865,64 @@ await check('计费按真实模型：设置页把「到底接管上没有」写�
   assert.equal(noteOf(off), undefined, '关掉之后不必再提接管状态')
 })
 
+await check('计费按真实模型：账单接上了不等于费用卡接上了，两件事分开写', async () => {
+  const saved = globalThis.fetch
+  const roleOf = (runtime, role) => runtime.nodes.find((node) => node.props?.['data-role'] === role)
+  const render = async (patch) => {
+    const runtime = new Runtime()
+    const state = initialState()
+    Object.assign(state, patch)
+    globalThis.fetch = async () => payloadResponse(state)
+    try {
+      const tree = await runtime.mount(page({ close() {}, t }))
+      return { runtime, flat: runtime.text(tree) }
+    } finally {
+      globalThis.fetch = saved
+    }
+  }
+
+  // 账单那一层早就在 `/state.billing` 里了；费用卡这一层是新的 `/state.labels`。
+  // 旧宿主只报 billing 时，界面不该凭空多出一行。
+  const onlyBilling = await render({ billing: { attached: true, routed: 3, billed: 3, unbilled: 0 } })
+  assert.notEqual(roleOf(onlyBilling.runtime, 'billing-note'), undefined, '账单那行照旧画')
+  assert.equal(roleOf(onlyBilling.runtime, 'label-note'), undefined, '没有 labels 字段就不画费用卡那行')
+
+  // 接上了：写清楚是「会话里那条本轮费用」看到的名字换了，并报出换过多少条。
+  const on = await render({
+    billing: { attached: true, routed: 3, billed: 3, unbilled: 0 },
+    labels: { attached: true, installedAt: 1, relabeled: 42, failures: 0, reason: 'installed' },
+  })
+  assert.equal(roleOf(on.runtime, 'label-note').text !== undefined, true)
+  assert.equal(roleOf(on.runtime, 'label-state').text, '费用卡已接管')
+  assert.ok(on.flat.includes('已经是真正跑的那个模型'), on.flat.slice(0, 260))
+  assert.ok(on.flat.includes('换过 42 条回复的名字'), `换过几条要说清：${on.flat.slice(0, 320)}`)
+
+  // 一条都还没换过（刚装上、界面还没人打开会话）：不报数，别写「换过 0 条」吓人。
+  const fresh = await render({
+    billing: { attached: true, routed: 0, billed: 0, unbilled: 0 },
+    labels: { attached: true, installedAt: 1, relabeled: 0, failures: 0, reason: 'installed' },
+  })
+  assert.equal(roleOf(fresh.runtime, 'label-state').text, '费用卡已接管')
+  assert.ok(!fresh.flat.includes('换过 0 条'), '刚接上时不报零')
+
+  // 没接上：别让人以为重启就好了 —— 说清楚它在等会话服务。
+  const off = await render({
+    billing: { attached: true, routed: 3, billed: 3, unbilled: 0 },
+    labels: { attached: false, failures: 0, reason: 'no-service' },
+  })
+  assert.equal(roleOf(off.runtime, 'label-state').text, '费用卡没接管')
+  assert.ok(off.flat.includes('它一发布就会自动接上'), off.flat.slice(0, 260))
+
+  // 关掉开关时两行都不提。
+  const disabled = await render({
+    settings: { ...initialState().settings, billByRealModel: false },
+    billing: { attached: true, routed: 3, billed: 3, unbilled: 0 },
+    labels: { attached: true, installedAt: 1, failures: 0, reason: 'installed' },
+  })
+  assert.equal(roleOf(disabled.runtime, 'billing-note'), undefined)
+  assert.equal(roleOf(disabled.runtime, 'label-note'), undefined, '关掉之后费用卡也不提')
+})
+
 await check('并发收工冷却：正在歇的候选在队列行上写明还要歇几秒，也不当「下一个」', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch

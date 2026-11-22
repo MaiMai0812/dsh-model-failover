@@ -335,6 +335,11 @@ window.__ModuleLoader__.load({
         billWaiting: '还没接到计费桥 —— 装好 dsh-cost-meter 后会自动接上',
         billSummary: '这一进程：路由名调用 {routed} 次，其中 {billed} 次记到了真实模型名下',
         billStuck: '这些调用一次都没落到真实模型名下，账单仍是「模型接力」的。关掉再打开这一项，或者重启 DSH。',
+        labelAttached: '费用卡已接管',
+        labelDetached: '费用卡没接管',
+        labelSummary: '会话里那条「本轮费用」看到的名字，已经是真正跑的那个模型',
+        labelCount: '这一进程换过 {count} 条回复的名字',
+        labelWaiting: '启动时还没等到会话服务，费用卡上的名字暂时还是「模型接力」—— 它一发布就会自动接上',
         optAllQuarantined: '全部被隔离时仍然按顺序试一遍',
         optAllQuarantinedHint: '关掉后队列里全是隔离模型时会直接报错，不再尝试。',
         optKeepLog: '记录事件日志',
@@ -562,6 +567,11 @@ window.__ModuleLoader__.load({
         billWaiting: 'No billing bridge yet — it attaches by itself once dsh-cost-meter is installed',
         billSummary: 'This process: {routed} routed calls, {billed} of them billed to the real model',
         billStuck: 'Not one of them reached the real model, so the bill is still under "Model Relay". Toggle this off and on again, or restart DSH.',
+        labelAttached: 'cost card attached',
+        labelDetached: 'cost card not attached',
+        labelSummary: 'The name on "this turn\'s cost" in a session is now the model that really ran',
+        labelCount: '{count} replies have been relabelled in this process',
+        labelWaiting: 'The session service was not there at startup, so the cost card still says "Model Relay" — it attaches by itself once the service shows up',
         optAllQuarantined: 'Still try the queue when all are quarantined',
         optAllQuarantinedHint: 'Turned off, an all-quarantined queue fails immediately.',
         optKeepLog: 'Keep an event log',
@@ -1570,10 +1580,39 @@ window.__ModuleLoader__.load({
         const said = attached
           ? [t('billSummary', { routed, billed }), stuck ? t('billStuck') : ''].filter(Boolean).join(' ')
           : t('billWaiting')
-        return div({ className: 'mf-opt', 'data-role': 'billing-note' },
-          div({ className: 'mf-opt-main' },
-            div(null, badge, span({ className: 'mf-note', style: { marginLeft: '8px' } }, said)),
+        /**
+         * 账单和费用卡是两条互不相干的路：账单走计费桥的 `createScope`，费用卡走
+         * 会话事件流里 `assistant/message` 的 `source`。桥接好了而卡片上还是路由名
+         * 是可能的（而且正是用户报的那个症状），所以两件事分开写、各自带状态。
+         */
+        const labels = state?.labels
+        const labelRow = labels === undefined || labels === null ? null : (() => {
+          const on = labels.attached === true
+          const seen = Number(labels.relabeled) || 0
+          const badge2 = h('span', {
+            className: `mf-badge ${on ? 'mf-ok' : 'mf-bad'}`,
+            'data-role': 'label-state',
+          }, on ? t('labelAttached') : t('labelDetached'))
+          // 接上了就报个数 —— 「接管了但一条都没换过」和「真的在换」一眼能分开。
+          const said2 = on
+            ? [t('labelSummary'), seen > 0 ? t('labelCount', { count: seen }) : ''].filter(Boolean).join(' ')
+            : t('labelWaiting')
+          return div({ className: 'mf-opt', 'data-role': 'label-note' },
+            div({ className: 'mf-opt-main' },
+              div(null, badge2, span({
+                className: 'mf-note',
+                style: { marginLeft: '8px' },
+              }, said2)),
+            ),
+          )
+        })()
+        return div(null,
+          div({ className: 'mf-opt', 'data-role': 'billing-note' },
+            div({ className: 'mf-opt-main' },
+              div(null, badge, span({ className: 'mf-note', style: { marginLeft: '8px' } }, said)),
+            ),
           ),
+          labelRow,
         )
       }
 

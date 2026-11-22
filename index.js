@@ -48,6 +48,7 @@ import { DailyHealth, nextResetAt, normalizeState } from './lib/health.js'
 import { Concurrency, MAX_CONCURRENCY, concurrencyOf } from './lib/limits.js'
 import { TurnNotes } from './lib/notes.js'
 import { ensureBillingAttribution, releaseBillingAttribution, billingAttributionStatus } from './lib/billing-attribution.js'
+import { installSessionLabels, installCostReader, releaseSessionLabels, sessionLabelStatus } from './lib/session-labels.js'
 import { JsonFile, dataDir, removeFile } from './lib/store.js'
 import { rejectionFor } from './lib/trust.js'
 
@@ -518,6 +519,69 @@ export function apply(ctx, _config) {
     logger.warn?.(`model-failover: 接管计费归属失败（账单会退回记在「模型接力」名下）— ${String(error?.message ?? error)}`)
   }
 
+  // ── 让费用卡上的名字是真正跑的那个模型，而不是「模型接力」 ─────────────────
+  //
+  // 做法与理由见 lib/session-labels.js 的文件头。一句话：会话页的「本轮费用」
+  // 不读账本，读的是会话事件流，而宿主写 `assistant/message` 时按外层请求的
+  // 身份（= 本插件的路由名）填 `source.provider/model`；真名只在同一条消息的
+  // `source.replayState.response` 里，cost-meter 明确把它丢掉。
+  //
+  // 关键取舍：`snapshotEvents()` 还有别的读者在**写盘**（会话持久化把尾巴读出来
+  // 落盘）和做分叉/投影，把真名塞给它们等于改写宿主持久数据。所以换名只换给
+  // 「算钱的人」：包一层 `costMeter` 的每个方法，调用期间挂一个「正在算钱」的
+  // 标记；`sessions.get()` 的门面只在这个标记下换名，其余时候原样返回。
+  //
+  // 时机是竞态：`sessions`、`costMeter` 都可能比本插件晚发布。所以先试一次，
+  // 失败就按毫秒级重试；之后每次 `/state` 轮询也顺手补一眼。
+  let ensureSessionLabels = () => false
+  let stopSessionRetry
+  try {
+    /** 与装计费桥同款节奏：最后一档落在 4 秒后，合计七次尝试。 */
+    const LABEL_RETRY_DELAYS = [200, 300, 500, 1_000, 2_000, 4_000]
+    let labelsPending = 0
+    const enabled = () => settingsFile.get().billByRealModel !== false
+    const attemptLabels = () => {
+      // 直接问 `ctx.get`：下面的 `optional()` 是个 `const`，在它之前用会踩 TDZ。
+      // 这两个服务都是稍后才发布的，问不到不算错。
+      const sessionService = typeof ctx.get === 'function' ? ctx.get('sessions') : undefined
+      const costMeter = typeof ctx.get === 'function' ? ctx.get('costMeter') : undefined
+      const sessions = installSessionLabels(sessionService, { route: ROUTE, enabled })
+      const reader = installCostReader(costMeter, { route: ROUTE, enabled })
+      if (sessions.ok && reader.ok) {
+        if (sessions.reason === 'installed' || reader.reason === 'installed') {
+          logger.info?.('model-failover: 费用卡与账单都按真实模型显示了（不再写「模型接力」）')
+        }
+        return true
+      }
+      return false
+    }
+    ensureSessionLabels = attemptLabels
+    if (!attemptLabels()) {
+      let timer
+      const tick = () => {
+        if (attemptLabels()) {
+          stopSessionRetry = undefined
+          return
+        }
+        if (labelsPending >= LABEL_RETRY_DELAYS.length) {
+          // 不是放弃：`snapshot()` 每次轮询还会再试，界面开着就一定会装上。
+          logger.warn?.('model-failover: 启动时没等到会话服务或费用服务，费用卡上的模型名暂时还是「模型接力」')
+          stopSessionRetry = undefined
+          return
+        }
+        timer = setTimeout(tick, LABEL_RETRY_DELAYS[labelsPending])
+        timer?.unref?.()
+        labelsPending += 1
+      }
+      timer = setTimeout(tick, LABEL_RETRY_DELAYS[labelsPending])
+      timer?.unref?.()
+      labelsPending += 1
+      stopSessionRetry = () => clearTimeout(timer)
+    }
+  } catch (error) {
+    logger.warn?.(`model-failover: 接管会话里的模型名失败（费用卡会继续写「模型接力」）— ${String(error?.message ?? error)}`)
+  }
+
   // ── 告诉模型设置页这条路由是可配置的 ─────────────────────────────────────
   // 纯尽力而为：老版本没有这个方法，或者本进程没有设置页，都不影响接力。
   try {
@@ -782,6 +846,18 @@ export function apply(ctx, _config) {
       // 日志一片安静，只有翻账本才会发现整天都记在「模型接力」名下。
       // `attached === false` 而 `routed > 0` 就是「补丁没生效」的指纹。
       billing: billingAttributionStatus(),
+      // 会话里的「本轮费用」按真名显示的这层挂上没有 —— 它包的是会话服务，
+      // 发布时机比计费桥还晚，所以同样值得写在界面上而不是只留在日志里。
+      labels: (() => {
+        try {
+          // 界面开着的时候每条 `/state` 轮询都补一眼：服务晚到、或者被换掉，
+          // 都能在这里自己接回去，不用重启。
+          ensureSessionLabels()
+        } catch {
+          /* 补不上就照实报 */
+        }
+        return sessionLabelStatus()
+      })(),
       // 每模型当天的失败/成功次数（所有会话、所有模板合计）——设置页队列前面
       // 那对红绿数字就是它。
       counts: view.counts,
@@ -1182,10 +1258,17 @@ export function apply(ctx, _config) {
       // 包在别人对象上的补丁要能收回：cost-meter 是常驻插件，不该在本插件卸载
       // 之后还留着一个已经没人在维护的壳。
       stopBillingRetry?.()
+      stopSessionRetry?.()
       try {
         releaseBillingAttribution()
       } catch {
         /* 桥已经不在了，那也没有可还原的东西 */
+      }
+      // 会话服务是宿主的常驻对象，本插件卸载后不该还留着一个没人维护的门面。
+      try {
+        releaseSessionLabels()
+      } catch {
+        /* 服务已经随 fiber 一起卸了 */
       }
       try {
         registration?.()

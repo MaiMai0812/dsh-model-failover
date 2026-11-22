@@ -32,6 +32,7 @@ const { TurnNotes } = await import('../lib/notes.js')
 const { Cooldowns } = await import('../lib/cooldown.js')
 const { Concurrency, concurrencyOf, MAX_CONCURRENCY } = await import('../lib/limits.js')
 const { ensureBillingAttribution, releaseBillingAttribution, billingAttributionStatus, dispatchNested, resetBillingAttributionStats } = await import('../lib/billing-attribution.js')
+const { installSessionLabels, installCostReader, releaseSessionLabels, sessionLabelStatus, relabelEvents, resetSessionLabelStats } = await import('../lib/session-labels.js')
 
 // ── 假的宿主 ────────────────────────────────────────────────────────────────
 
@@ -2675,6 +2676,157 @@ await check('计费归属：外层没落账时状态里看得见，不是只有�
   }
 })
 
+await check('会话里的模型名：费用卡读到的 assistant/message 是真正跑的那个模型', async () => {
+  // 这一条盯的是**用户看到的那张卡**：它不是读账本，而是读会话事件流里
+  // `assistant/message.data.message.source.{provider,model}`，宿往往那里写的是外层身份
+  // （= 本插件的路由名）。真名只在同一条消息的 `source.replayState.response` 里。
+  const message = {
+    role: 'assistant',
+    id: 'm1',
+    source: {
+      kind: 'model',
+      provider: ROUTE,
+      model: 'default',
+      replayState: { response: { kind: 'pi-ai', version: 2, provider: 'ginka', model: 'deepseek-v4.1-flash' } },
+    },
+  }
+  const events = [
+    { type: 'session', id: 's1', createdAt: 1 },
+    { type: 'request/header', seq: 1, data: { header: { config: { provider: ROUTE, model: 'default' } } } },
+    { type: 'assistant/message', seq: 2, data: { turn: 1, step: 1, message, usage: { inputTokens: 10, outputTokens: 2 } } },
+  ]
+  const relabeled = relabelEvents(events, ROUTE)
+  assert.notEqual(relabeled, events, '有可换的行就该给一份新数组')
+  assert.equal(relabeled[2].data.message.source.provider, 'ginka')
+  assert.equal(relabeled[2].data.message.source.model, 'deepseek-v4.1-flash')
+  assert.equal(relabeled[2].data.usage.inputTokens, 10, '用量一个字节都不动')
+  assert.equal(relabeled[2].data.message.source.replayState.response.provider, 'ginka', '重放凭据原样保留')
+  assert.equal(events[2].data.message.source.provider, ROUTE, '原事件不许被改（它们是深冻结的）')
+
+  // 没有 replayState、或本来就不是本路由的消息：连新数组都不该产生。
+  const plain = [{ type: 'assistant/message', seq: 3, data: { message: { source: { kind: 'model', provider: 'alpha', model: 'one' } } } }]
+  assert.equal(relabelEvents(plain, ROUTE), plain)
+  const routeNoReplay = [{ type: 'assistant/message', seq: 4, data: { message: { source: { kind: 'model', provider: ROUTE, model: 'default' } } } }]
+  assert.equal(relabelEvents(routeNoReplay, ROUTE), routeNoReplay, '真名缺席时保持原样，别凭空编一个')
+})
+
+await check('会话里的模型名：只有算钱的人看到真名，写盘的还是原样', async () => {
+  // 宿主会话对象用的是私有字段，Proxy 的 get 必须把 this 钉在原对象上 —— 这里用
+  // 一个带 `#log` 的类把这条契约锁住。
+  class FakeSession {
+    #log
+    constructor(id, log) {
+      this.#log = log
+      this.id = id
+    }
+    get seq() {
+      return this.#log.length
+    }
+    snapshotEvents(from = 0, to = this.#log.length) {
+      return Object.freeze(this.#log.slice(from, to))
+    }
+    ownEvents() {
+      return this.snapshotEvents(0)
+    }
+    eventAt(seq) {
+      return this.#log[seq]
+    }
+    title() {
+      return `会话 ${this.id}`
+    }
+  }
+  const message = {
+    role: 'assistant',
+    id: 'm1',
+    source: { kind: 'model', provider: ROUTE, model: 'default', replayState: { response: { provider: 'xxzl', model: 'deepseek-flash' } } },
+  }
+  const session = new FakeSession('s1', [
+    { type: 'session', id: 's1', createdAt: 1 },
+    { type: 'assistant/message', seq: 1, data: { message } },
+  ])
+  const service = { get: (id) => (id === 's1' ? session : undefined) }
+  const original = service.get
+  // 假的费用服务：`getTurnCost` 就是费用卡真正的入口（turn-cost.js:111 那两句），
+  // `peek` 用来验「壳」本身是不是个正经会话对象。
+  let captured
+  const costMeter = {
+    async getTurnCost(sessionId) {
+      const live = service.get(sessionId)
+      return live.snapshotEvents().map((event) => event.data?.message?.source?.provider).filter(Boolean)
+    },
+    async peek(sessionId) {
+      captured = service.get(sessionId)
+      return true
+    },
+  }
+  const originalTurnCost = costMeter.getTurnCost
+  const originalPeek = costMeter.peek
+  try {
+    assert.equal(installSessionLabels(service, { route: ROUTE, enabled: () => true }).ok, true)
+    assert.equal(installCostReader(costMeter, { route: ROUTE, enabled: () => true }).ok, true)
+
+    // ① 算钱的人：拿到的是壳，读出来是真名。
+    const seen = await costMeter.getTurnCost('s1')
+    assert.deepEqual(seen, ['xxzl'], `费用卡该看到真名：${JSON.stringify(seen)}`)
+
+    // ② 换名的壳本身也得是个正经会话对象：属性透传、方法 bind 回原对象（私有字段）。
+    await costMeter.peek('s1')
+    const face = captured
+    assert.notEqual(face, session, '算钱的上下文里取到的是壳')
+    assert.equal(face.id, 's1', '别的属性照旧透传')
+    assert.equal(face.title(), '会话 s1', '方法要 bind 回原对象（私有字段才活得下来）')
+    assert.equal(face.seq, 2, '取值器也要对')
+    assert.equal(face.snapshotEvents()[1].data.message.source.provider, 'xxzl')
+    assert.equal(face.ownEvents()[1].data.message.source.model, 'deepseek-flash')
+    assert.equal(face.eventAt(1).data.message.source.provider, 'xxzl')
+    assert.equal(session.snapshotEvents()[1].data.message.source.provider, ROUTE, '原会话一个字节都没变')
+
+    // ③ 最要紧的一条：**不在算钱的上下文里**（宿主写盘、分叉、做投影都是这样读的），
+    //    拿到的必须是原对象 —— 否则等于改写宿主的持久数据。
+    assert.equal(service.get('s1'), session, '不认识的读者拿到的就是原会话')
+    assert.equal(service.get('nope'), undefined, '查不到的会话照样是 undefined')
+
+    assert.equal(sessionLabelStatus().attached, true)
+    // 换过多少条要能看见：接上了却一条都没换，和真的在换，是两回事。
+    assert.ok(sessionLabelStatus().relabeled >= 3, `换过的条数要计数：${JSON.stringify(sessionLabelStatus())}`)
+
+    // ④ 用户把开关关掉：立刻回到宿主原样，不用重启。
+    installSessionLabels(service, { route: ROUTE, enabled: () => false })
+    assert.equal(service.get('s1'), session, '关掉之后谁拿到的都是原对象')
+    assert.deepEqual(await costMeter.getTurnCost('s1'), [ROUTE], '关掉之后费用卡也回到路由名')
+  } finally {
+    assert.equal(releaseSessionLabels(), true)
+    assert.equal(service.get, original, '卸载要把 sessions.get 还原')
+    assert.equal(costMeter.getTurnCost, originalTurnCost, '卸载要把费用服务的方法还原')
+    assert.equal(costMeter.peek, originalPeek)
+    resetSessionLabelStats()
+  }
+})
+
+await check('会话里的模型名：两个服务谁晚到都等，装上之后自愈', async () => {
+  resetSessionLabelStats()
+  const missing = installSessionLabels(undefined, { route: ROUTE, enabled: () => true })
+  assert.deepEqual(missing, { ok: false, reason: 'no-service' }, '服务还没发布时不算错，等着就行')
+  assert.deepEqual(installCostReader(undefined, { route: ROUTE, enabled: () => true }),
+    { ok: false, reason: 'no-cost-meter' }, '费用服务没发布也一样')
+  assert.equal(sessionLabelStatus().attached, false, '两边都缺时不算接上')
+
+  const service = { get: () => undefined }
+  const costMeter = { async getTurnCost() { return [] } }
+  try {
+    assert.equal(installSessionLabels(service, { route: ROUTE, enabled: () => true }).reason, 'installed')
+    // 只装了一半：会话换了名但没人挂标记 —— 谁都不会看到真名，也就不能算接上。
+    assert.equal(sessionLabelStatus().attached, false, '只装一半不算接上')
+    assert.equal(installCostReader(costMeter, { route: ROUTE, enabled: () => true }).reason, 'installed')
+    assert.equal(sessionLabelStatus().attached, true)
+    assert.equal(installSessionLabels(service, { route: ROUTE, enabled: () => true }).reason, 'already', '重复装是幂等的')
+    assert.equal(installCostReader(costMeter, { route: ROUTE, enabled: () => true }).reason, 'already')
+  } finally {
+    releaseSessionLabels()
+    resetSessionLabelStats()
+  }
+})
+
 await check('红绿计数：失败一次记一次、成功一次记一次，跨会话合计', async () => {
   const alphaKey = routeKey('alpha', 'one')
   const scripts = new Map([[alphaKey, quota('额度没了')]])
@@ -2837,6 +2989,29 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     assert.equal(typeof plain.run, 'function', '别的路由照旧走原实现')
     assert.equal(await plain.finish(), false)
 
+    // 会话服务比本插件晚发布：当时装不上不算错，之后 /state 每次轮询都会补一眼。
+    // 这里在 apply 之后才把服务塞进去，正好走那条「自愈」路径。
+    const hostMessage = {
+      role: 'assistant',
+      id: 'm1',
+      source: { kind: 'model', provider: ROUTE, model: 'default', replayState: { response: { provider: 'ginka', model: 'deepseek-v4.1-flash' } } },
+    }
+    const fakeSession = {
+      id: 'session-host',
+      seq: 1,
+      header: { createdAt: 1 },
+      snapshotEvents: () => [{ type: 'assistant/message', seq: 0, data: { message: hostMessage } }],
+    }
+    const originalSessionsGet = (id) => (id === 'session-host' ? fakeSession : undefined)
+    services.sessions = { get: originalSessionsGet }
+    // 费用服务也一样：只有从它的方法里读会话，才该看到真名（宿主写盘/分叉读到的
+    // 仍是原样，那条不许被我们换名）。
+    const originalTurnCost = async function getTurnCost(sessionId) {
+      const live = services.sessions.get(sessionId)
+      return live.snapshotEvents().map((event) => event.data?.message?.source?.provider).filter(Boolean)
+    }
+    services.costMeter = { getTurnCost: originalTurnCost }
+
     assert.equal(registrations.length, 1, '应注册恰好一条路由')
     assert.deepEqual(registrations[0].providers, [ROUTE])
     assert.equal(registered.length, 1)
@@ -2867,6 +3042,13 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
       [routeKey('alpha', 'one'), routeKey('beta', 'one')].sort(), '首次运行应把已接入的模型灌进队列')
     assert.equal(state.json.settings.templates[0].id, 'default')
     assert.equal(state.json.settings.editedTemplate, 'default')
+    // 会话里的模型名：这一眼 `/state` 顺手把会话服务包上了（服务是 apply 之后才
+    // 发布的），所以状态里应当说「已接管」，而读会话拿到的是真名。
+    assert.equal(state.json.labels.attached, true, `会话名这层该自己接上：${JSON.stringify(state.json.labels)}`)
+    // 算钱的人（走费用服务的入口）看到的是真名……
+    assert.deepEqual(await services.costMeter.getTurnCost('session-host'), ['ginka'])
+    // ……而别的读者（宿主写盘、分叉、投影都是这样读的）拿到的还是原样。
+    assert.equal(services.sessions.get('session-host'), fakeSession, '不认识的读者拿到的必须是原对象')
 
     // 设置页要按每个模型自己的档位表画下拉框，所以清单行必须带上档位。
     const row = (provider, model) => state.json.catalog.find((item) => item.provider === provider && item.model === model)
@@ -3305,6 +3487,8 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     }
     // 包在别人对象上的补丁要收回去：卸载之后不该留下一个没人维护的壳。
     assert.equal(bridge.createScope, originalCreateScope, '卸载要把计费桥还原')
+    assert.equal(services.sessions.get, originalSessionsGet, '卸载也要把会话服务的 get 还原')
+    assert.equal(services.costMeter.getTurnCost, originalTurnCost, '卸载也要把费用服务的方法还原')
   } finally {
     delete globalThis[BRIDGE_KEY]
     process.env.DSH_HOME = previous
