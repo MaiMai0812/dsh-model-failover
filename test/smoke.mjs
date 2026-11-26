@@ -3313,6 +3313,32 @@ await check('宿主半身：注册路由 + 设置接口读写 + 队列自动填�
     // 收摊：把这一条撤销，免得影响后面「并发限制」那几条对占用数的断言。
     await call('POST', '/api/dsh-model-failover/reset?sessionId=sess-skip', {})
 
+    // ── 限流冷却要跟着 /sessions 一起发 ──────────────────────────────────────
+    // 会话页「已验证」那一栏要把正在被限流的模型画成黄的，并说明「还要等多久」。
+    // 它拿不到冷却表就只能看到一个排着队、却被莫名绕开的模型。
+    await call('POST', '/api/dsh-model-failover/settings', {
+      templates: [{ id: 'default', name: '默认模板', order: [{ provider: 'alpha', model: 'one' }] }],
+    })
+    scripts.set(routeKey('alpha', 'one'), rateLimited('rate limited, retry after 30s'))
+    for await (const _ of registrations[0].adapter.stream({
+      provider: ROUTE,
+      model: 'auto',
+      messages: [{ role: 'user', content: [{ type: 'text', text: '跑一下' }] }],
+      sessionId: 'sess-cool',
+    })) { /* 把流跑完 */ }
+    const coolingView = await call('GET', '/api/dsh-model-failover/sessions')
+    assert.equal(Array.isArray(coolingView.json.cooling), true, '/sessions 要带上限流冷却表')
+    const coolRow = coolingView.json.cooling.find((row) => row.key === routeKey('alpha', 'one'))
+    assert.ok(coolRow !== undefined, `刚被限流的那个要在冷却表里：${JSON.stringify(coolingView.json.cooling)}`)
+    assert.equal(coolRow.provider, 'alpha', '拆好的 provider 一起给，界面不用自己切 key')
+    assert.equal(coolRow.model, 'one')
+    assert.equal(typeof coolRow.label, 'string', '显示名也拼好')
+    assert.equal(typeof coolRow.until, 'number', '要给绝对结束时刻，界面才能自己往下数')
+    assert.ok(coolRow.until > coolingView.json.now, '结束时刻在未来')
+    // 收摊：解掉冷却，别让后面那几条用例撞上「先等一会儿」。
+    await call('POST', '/api/dsh-model-failover/reset?sessionId=sess-cool', {})
+    scripts.set(routeKey('alpha', 'one'), ok('hi'))
+
     // ── 并发限制：跨会话的实时账，含此刻空着的候选 ──────────────────────────
     // 两个候选都设了上限：alpha 跑了两个会话（上限 2，占满），beta 一个都没跑
     // （上限 1，空着）。会话页那一栏给的是**全量**：空着的 beta 也得在，否则

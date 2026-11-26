@@ -680,7 +680,7 @@ const queue = sections[2].component
  * 传 `null` 表示**这份响应里根本没有这个字段** —— 用来模拟「新前端配旧宿主」
  * 那种半身错版：那时占用还挂在每一行的 `capped` 上。
  */
-const sessionsPayload = (sessions, day = '2026-11-27', view = { subagentSessions: false, foreignSessions: true }, limits = []) => ({
+const sessionsPayload = (sessions, day = '2026-11-27', view = { subagentSessions: false, foreignSessions: true }, limits = [], cooling = []) => ({
   ok: true,
   status: 200,
   text: async () => JSON.stringify({
@@ -692,6 +692,7 @@ const sessionsPayload = (sessions, day = '2026-11-27', view = { subagentSessions
     templates: [{ id: 'default', name: '默认模板' }, { id: 'spare', name: '备用模板' }],
     view,
     ...(limits === null ? {} : { limits }),
+    cooling,
     sessions,
   }),
 })
@@ -1024,6 +1025,78 @@ await check('隔离队列：「已验证」那条的叉叉发的是 kind=good，
   assert.equal(posted.length >= 1, true)
   assert.equal(JSON.parse(posted[0].body).kind, 'good', '这份名单是「已验证」，kind 必须说清楚')
   assert.equal(JSON.parse(posted[0].body).templateId, 'spare', '模板 id 原样带出去')
+})
+
+await check('隔离队列：已验证里正在被限流的那个画成黄的，悬停说还要等多久', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 两条都挂在「已验证」上：alpha 此刻正被限流，beta 好好的。
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-mine',
+      good: [
+        { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' },
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: 'Code99 · Beta One' },
+      ],
+    }),
+  ], '2026-11-27', { subagentSessions: false, foreignSessions: true }, [], [
+    // 宿主给的是绝对结束时刻，界面拿它自己往下数。
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at, until: Date.now() + 30_000, held: false, remainingMs: 30_000, label: '硅基流动 · Alpha One' },
+  ])
+  let chips
+  let limited
+  let normal
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    chips = fresh.nodes.filter((node) => String(node.props?.className ?? '').includes('mf-qv-item'))
+    limited = chips.filter((node) => String(node.props?.className ?? '').includes('mf-warn'))
+    normal = chips.filter((node) => String(node.props?.className ?? '').includes('mf-ok'))
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  assert.equal(limited.length, 1, `只有被限流的那一颗该变黄，实际：${limited.length}`)
+  assert.equal(limited[0].props['data-role'], 'qv-limited', '黄的那颗要能被认出来')
+  // 悬停才说「还要等多久」：这句话必须真的带上剩余时间，而不是一句空话。
+  assert.match(String(limited[0].props.title ?? ''), /还要 30 秒/, `悬停要说清剩多久，实际：${limited[0].props.title}`)
+  assert.match(String(limited[0].props.title ?? ''), /不算今天的隔离/, '还要说清它不是隔离')
+  // 没被限流的那一颗照旧是绿的，也不该多出悬停提示。
+  assert.equal(normal.length, 1, `另一颗应保持绿色，实际：${normal.length}`)
+  assert.equal(normal[0].props['data-role'], 'qv-good')
+  assert.equal(normal[0].props.title, undefined, '好好的模型不该有悬停提示')
+})
+
+await check('隔离队列：宿主没给冷却表时（新前端配旧宿主）一律还是绿的', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 老宿主的响应里根本没有 `cooling` 这个字段。
+  const legacy = {
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({
+      ok: true,
+      now: at,
+      day: '2026-11-27',
+      route: { provider: 'model-failover', label: '模型接力' },
+      templates: [{ id: 'default', name: '默认模板' }],
+      view: { subagentSessions: false, foreignSessions: true },
+      limits: [],
+      sessions: [sessionRow({
+        sessionId: 's-mine',
+        good: [{ key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' }],
+      })],
+    }),
+  }
+  globalThis.fetch = async () => legacy
+  let chips
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    chips = fresh.nodes.filter((node) => String(node.props?.className ?? '').includes('mf-qv-item'))
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(chips.filter((node) => String(node.props?.className ?? '').includes('mf-warn')).length, 0, '没有冷却表就不该凭空变黄')
+  assert.equal(chips.filter((node) => String(node.props?.className ?? '').includes('mf-ok')).length, 1, '照旧是绿的')
 })
 
 await check('隔离队列：划记录失败时如实报错，不假装删掉了', async () => {

@@ -987,6 +987,17 @@ export function apply(ctx, _config) {
           // 一旦没人占，这一栏会整块消失 —— 而它消失的原因和「这台机器没配并发
           // 上限」长得一模一样，用户没法分辨。空着的那些在界面上淡着显示。
           limits: limitsView(undefined),
+          // 限流冷却表（内存态，不分会话）。会话页「已验证」那一栏要靠它把正在
+          // 被限流的模型画成黄的，并说明「还要等多久」—— 否则用户只看到它排
+          // 在那里，却不知道队列为什么这一趟绕开了它。
+          //
+          // 带上 `until`（绝对时刻）而不是只给 `remainingMs`：这一栏十几秒才
+          // 轮询一次，界面拿绝对时刻自己往下数，倒计时才不会一跳一跳。
+          cooling: cooldowns.view().map((row) => ({
+            ...row,
+            ...splitKey(row.key),
+            label: labelOf(row.provider, row.model),
+          })),
           sessions: sessionRows(now),
         })
         return

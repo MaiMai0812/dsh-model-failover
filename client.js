@@ -173,6 +173,11 @@ window.__ModuleLoader__.load({
 .mf-qv-item { display: inline-flex; align-items: baseline; gap: 6px; padding: 1px 8px; border-radius: 999px; border: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 11.5px; }
 .mf-qv-item.mf-bad { border-color: color-mix(in srgb, #e5484d 55%, transparent); color: #e5484d; }
 .mf-qv-item.mf-ok { border-color: color-mix(in srgb, #30a46c 55%, transparent); color: #30a46c; }
+/* 「已验证」里正在被限流的那一颗：黄色。
+   它今天没坏（还挂在已验证名单上），只是上游让它等几十秒 —— 红的是「今天不行」，
+   绿的是「好好的」，中间这一档得有自己的颜色，否则用户只看到队列莫名其妙绕开
+   一个「看着没问题」的模型。等冷却结束它自己就回到绿色。 */
+.mf-qv-item.mf-warn { border-color: color-mix(in srgb, #d9a441 60%, transparent); color: #d9a441; }
 /* 设了上限、此刻却没人在用的候选：它确实生效着，只是眼下空着。淡一档，别跟
    正在被占着的那几颗抢注意力，但也绝不能藏起来 —— 藏了就等于「我的设置没生效」。 */
 .mf-qv-item.mf-idle { opacity: .5; border-style: dashed; }
@@ -430,6 +435,7 @@ window.__ModuleLoader__.load({
         qvActive: '正在用',
         qvQuarantined: '已隔离',
         qvQueued: '已验证',
+        qvLimitedHint: '上游正在限流：{text}。它没坏，只是这一会儿忙 —— 等完了自己就回到队列里，不算今天的隔离。',
         qvCurrent: '当前会话',
         qvRunning: '运行中',
         qvSwitching: '正在换人',
@@ -662,6 +668,7 @@ window.__ModuleLoader__.load({
         qvActive: 'In use',
         qvQuarantined: 'Quarantined',
         qvQueued: 'Verified',
+        qvLimitedHint: 'The upstream is rate limiting it — {text}. It is not broken, just busy for a moment; it rejoins the queue on its own and this is not a quarantine.',
         qvCurrent: 'This conversation',
         qvRunning: 'Running',
         qvSwitching: 'Switching',
@@ -1631,21 +1638,10 @@ window.__ModuleLoader__.load({
       }
 
       /**
-       * 「还要等 N 秒」——冷却剩多少。
-       *
-       * 超过一分钟就按分钟说：`还要等 2 分 10 秒` 比 `还要等 130 秒` 好读，
-       * 而冷却最长也就一小时（设置里的上界）。
+       * 「还要等 N 秒」——冷却剩多少。实现见顶层的 `coolingText()`：隔离队列页
+       * 那颗黄胶囊也要说同一句话，两处必须是同一个口径。
        */
-      const coolingText = (ms, held) => {
-        if (held === true) return t('coolingHeld')
-        const total = Math.max(0, Math.ceil(ms / 1000))
-        if (total < 60) return t('coolingSec', { n: total })
-        const minutes = Math.floor(total / 60)
-        const seconds = total % 60
-        return seconds === 0
-          ? t('coolingMin', { n: minutes })
-          : t('coolingMinSec', { n: minutes, s: seconds })
-      }
+      const coolingText = (ms, held) => coolingLeftText(ms, held, t)
 
       /**
        * 队列里第一个真正能用的模型 —— 也就是下一个任务会从谁起头。
@@ -2723,6 +2719,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 「还要等 N 秒」—— 限流冷却还剩多少。
+     *
+     * 超过一分钟就按分钟说：`还要等 2 分 10 秒` 比 `还要等 130 秒` 好读，而冷却
+     * 最长也就一小时（设置里的上界）。
+     *
+     * 提成顶层函数是因为它有两处要用：设置页队列行上的那颗「忙」标签，以及隔离
+     * 队列页「已验证」里那一颗被限流的黄胶囊的悬停提示 —— 两处必须同一口径，
+     * 各写一份迟早会说出两个不同的剩余时间。
+     */
+    function coolingLeftText(ms, held, t) {
+      if (held === true) return t('coolingHeld')
+      const total = Math.max(0, Math.ceil((Number.isFinite(ms) ? ms : 0) / 1000))
+      if (total < 60) return t('coolingSec', { n: total })
+      const minutes = Math.floor(total / 60)
+      const seconds = total % 60
+      return seconds === 0
+        ? t('coolingMin', { n: minutes })
+        : t('coolingMinSec', { n: minutes, s: seconds })
+    }
+
+    /**
      * 一栏里的一行会话。
      *
      * `useSessions` 由宿主以标准 hook 属性注入（dsh-client-ui-session 的
@@ -2730,7 +2747,7 @@ window.__ModuleLoader__.load({
      * 拿不到时退回会话号前缀 —— 这一栏是给人看「哪个会话出事了」，标题只是
      * 帮助识别，缺了也不能空白。
      */
-    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, onSkip, busy, onCopyError, copiedKey, nowMs }) {
+    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, onSkip, busy, onCopyError, copiedKey, nowMs, cooling }) {
       const quarantined = row?.quarantined ?? []
       const good = row?.good ?? []
       const active = row?.active
@@ -2775,6 +2792,18 @@ window.__ModuleLoader__.load({
       const switching = running !== undefined && running.streaming === false
       /** 「当前」那一行报的是谁：正在跑的优先，没有就是上一趟跑过的。 */
       const currentItem = running ?? active
+
+      /**
+       * 这个模型此刻在不在限流冷却里（`key\0templateId` → 冷却那一行）。
+       *
+       * 「已验证」名单是**按会话 × 模板**记的，冷却表却是全机器一份（上游限流
+       * 跟哪个会话撞的没关系）。所以这里只按模型 key 查，不看模板：一个模型被
+       * 限流了，它在任何一条队列里都是「先绕开它一会儿」。
+       */
+      const coolingOf = (item) => {
+        const key = typeof item?.key === 'string' ? item.key : keyOf(item?.provider, item?.model)
+        return cooling?.get?.(key)
+      }
 
       /**
        * 「这个模型被用了多久」。
@@ -2936,10 +2965,27 @@ window.__ModuleLoader__.load({
           : div({ className: 'mf-qv-line' },
               span({ className: 'mf-qv-label' }, t('qvQueued')),
               div({ className: 'mf-qv-list' },
-                ...good.map((item) => h('span', {
-                  className: 'mf-qv-item mf-ok',
-                  key: `${item.key ?? ''}\u0000${item.templateId ?? ''}`,
-                }, forgetButton(item, 'good'), sessionItemLabel(item), speedChip(item), timeChip(item))),
+                ...good.map((item) => {
+                  // 它此刻在不在限流冷却里。名单是「今天行不行」，冷却表是
+                  // 「这一会儿忙不忙」—— 两件事，一颗胶囊要同时说清。
+                  const cool = coolingOf(item)
+                  // 剩余时间按「结束时刻 - 现在」现算，不用宿主给的 remainingMs：
+                  // 这一栏十几秒才轮询一次，拿快照里的数字会一跳一跳，而这里
+                  // 每秒都在重画（见 SessionQueue 的 nowMs 定时器）。
+                  const left = cool === undefined
+                    ? 0
+                    : Math.max(0, Number(cool.until ?? 0) - Number(nowMs ?? Date.now()))
+                  const limited = cool !== undefined && (left > 0 || cool.held === true)
+                  const said = limited ? coolingLeftText(left, cool.held === true, t) : ''
+                  return h('span', {
+                    className: limited ? 'mf-qv-item mf-warn' : 'mf-qv-item mf-ok',
+                    key: `${item.key ?? ''}\u0000${item.templateId ?? ''}`,
+                    // 悬停才说「还要等多久」：铺在行里会把这一栏撑得很长，而
+                    // 「它被限流了」这件事用颜色一眼就够，细节等用户想知道时再给。
+                    ...(limited ? { title: t('qvLimitedHint', { text: said }) } : {}),
+                    'data-role': limited ? 'qv-limited' : 'qv-good',
+                  }, forgetButton(item, 'good'), sessionItemLabel(item), speedChip(item), timeChip(item))
+                }),
               ),
             ),
       )
@@ -2999,19 +3045,38 @@ window.__ModuleLoader__.load({
       const running = (data?.sessions ?? []).some((row) => row?.running !== undefined)
 
       /**
-       * 正在跑的那个模型的「已用时长」要一秒一跳。
+       * 限流冷却表：`模型 key → 冷却那一行`（全机器一份，不分会话）。
+       *
+       * 「已验证」名单里的胶囊靠它决定要不要画成黄的，以及悬停时说「还要等多久」。
+       * 宿主没给这个字段（新前端配旧宿主）就是空表 —— 那时所有胶囊照旧是绿的，
+       * 也就是改这一条之前的样子，不会凭空多出黄色。
+       */
+      const cooling = useMemo(() => {
+        const table = new Map()
+        for (const row of Array.isArray(data?.cooling) ? data.cooling : []) {
+          if (typeof row?.key === 'string' && row.key !== '') table.set(row.key, row)
+        }
+        return table
+      }, [data])
+
+      // 有没有人正被限流 —— 黄胶囊上的倒计时要一秒一跳，所以这也得驱动那个
+      // 定时器；不然用户看到的是一个停在「还要等 40 秒」不动的数字。
+      const coolingNow = cooling.size > 0
+
+      /**
+       * 正在跑的那个模型的「已用时长」要一秒一跳，被限流的那个倒计时也要。
        *
        * 轮询最快也是几秒一次，光靠它数字会一顿一顿的，看着像卡住；这个本地
        * 定时器只负责让画面重画，时间本身是拿 `Date.now()` 现算的。
-       * 没人在跑就不开 —— 这一栏大部分时间没人盯着，白跳没有意义。
+       * 没人在跑、也没人歇着就不开 —— 这一栏大部分时间没人盯着，白跳没有意义。
        */
       const [nowMs, setNowMs] = useState(() => Date.now())
       useEffect(() => {
-        if (!running) return undefined
+        if (!running && !coolingNow) return undefined
         setNowMs(Date.now())
         const timer = setInterval(() => setNowMs(Date.now()), 1_000)
         return () => clearInterval(timer)
-      }, [running])
+      }, [running, coolingNow])
 
       useEffect(() => {
         alive.current = true
@@ -3313,6 +3378,7 @@ window.__ModuleLoader__.load({
                 onCopyError: (item, chipKey) => void copyError(item, chipKey),
                 copiedKey: copied,
                 nowMs,
+                cooling,
               })),
       )
     }
