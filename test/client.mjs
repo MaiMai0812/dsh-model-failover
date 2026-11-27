@@ -1027,7 +1027,7 @@ await check('隔离队列：「已验证」那条的叉叉发的是 kind=good，
   assert.equal(JSON.parse(posted[0].body).templateId, 'spare', '模板 id 原样带出去')
 })
 
-await check('隔离队列：已验证里正在被限流的那个画成黄的，悬停说还要等多久', async () => {
+await check('隔离队列：已验证里正在被限流的那个画成黄的，悬停直接说还有多久恢复', async () => {
   const fresh = new Runtime()
   const saved = globalThis.fetch
   // 两条都挂在「已验证」上：alpha 此刻正被限流，beta 好好的。
@@ -1057,13 +1057,125 @@ await check('隔离队列：已验证里正在被限流的那个画成黄的，�
 
   assert.equal(limited.length, 1, `只有被限流的那一颗该变黄，实际：${limited.length}`)
   assert.equal(limited[0].props['data-role'], 'qv-limited', '黄的那颗要能被认出来')
-  // 悬停才说「还要等多久」：这句话必须真的带上剩余时间，而不是一句空话。
-  assert.match(String(limited[0].props.title ?? ''), /还要 30 秒/, `悬停要说清剩多久，实际：${limited[0].props.title}`)
-  assert.match(String(limited[0].props.title ?? ''), /不算今天的隔离/, '还要说清它不是隔离')
+  // 悬停直接给结论，不带「上游正在限流…它没坏…」那套铺垫：用户停上去要的
+  // 就是「还要等多久」这一个数字。
+  assert.equal(
+    limited[0].props.title,
+    '限流中，30 秒后恢复',
+    `悬停要直接说清几分钟后恢复，实际：${limited[0].props.title}`,
+  )
   // 没被限流的那一颗照旧是绿的，也不该多出悬停提示。
   assert.equal(normal.length, 1, `另一颗应保持绿色，实际：${normal.length}`)
   assert.equal(normal[0].props['data-role'], 'qv-good')
   assert.equal(normal[0].props.title, undefined, '好好的模型不该有悬停提示')
+})
+
+await check('隔离队列：限流的悬停按分秒说，整分钟不带秒，到了点在等这一趟', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const now = Date.now()
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-mine',
+      good: [
+        { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' },
+        { key: KEY('beta', 'one'), provider: 'beta', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: 'Code99 · Beta One' },
+        { key: KEY('gamma', 'two'), provider: 'gamma', model: 'two', at, sessionId: 's-mine', templateId: 'default', label: 'Gamma Two' },
+      ],
+    }),
+  ], '2026-11-27', { subagentSessions: false, foreignSessions: true }, [], [
+    // 三颗黄胶囊，说三句不同的话：越过分但不到整分、正好整分、以及到点了还在等。
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at: now - 5_000, until: now + 125_000, held: false, label: '硅基流动 · Alpha One' },
+    { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at: now - 5_000, until: now + 120_000, held: false, label: 'Code99 · Beta One' },
+    { key: KEY('gamma', 'two'), provider: 'gamma', model: 'two', code: 'RATE_LIMIT', message: 'slow down', at: now - 60_000, until: now - 1_000, held: true, label: 'Gamma Two' },
+  ])
+  let limited
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    limited = fresh.nodes.filter((node) => node.props?.['data-role'] === 'qv-limited')
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  assert.equal(limited.length, 3, `三条都该变黄，实际：${limited.length}`)
+  // 125 秒 → 2 分 5 秒；120 秒整 → 只说「2 分」，不写成「2 分 0 秒」。
+  assert.match(String(limited[0].props.title), /^限流中，2 分 5 秒后恢复$/, `实际：${limited[0].props.title}`)
+  assert.match(String(limited[1].props.title), /^限流中，2 分后恢复$/, `实际：${limited[1].props.title}`)
+  // 到点了但这一趟还在替它跑：这时候说「0 秒后恢复」是撒谎，得说清在等什么。
+  assert.equal(limited[2].props.title, '限流已结束，等这一趟跑完')
+})
+
+await check('隔离队列：只有模型在限流、没有人在跑时，不为了倒计时每秒重画整栏', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const start = intervals.length
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-mine',
+      good: [
+        { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' },
+      ],
+    }),
+  ], '2026-11-27', { subagentSessions: false, foreignSessions: true }, [], [
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at, until: Date.now() + 40_000, held: false, label: '硅基流动 · Alpha One' },
+  ])
+  let limited
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    limited = fresh.nodes.filter((node) => node.props?.['data-role'] === 'qv-limited')
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  // 悬停里的剩余时间是鼠标停上去那一刻现算的，不需要一个每秒转的定时器去喂它。
+  // 之前那台定时器会在「有人在冷却里」时也开起来，等于为了一个大多数人没停上去
+  // 看的数字，每秒重画整栏（速度、时长跟着一起重算）。
+  const used = intervals.slice(start)
+  assert.equal(used.includes(1_000), false, `没人跑着就不该开每秒定时器，实际：${used.join(', ')}`)
+  // 那颗胶囊照样是黄的、悬停照样带数字 —— 去掉的只是刷新，不是信息。
+  assert.equal(limited.length, 1)
+  assert.match(String(limited[0].props.title), /^限流中，\d+ 秒后恢复$/, `实际：${limited[0].props.title}`)
+})
+
+await check('隔离队列：鼠标停上去那一刻才现算剩余时间，数字跟着往前走到当下', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  const now = Date.now()
+  // 宿主给的是 40 秒后恢复。第一次渲染时界面算出来是「40 秒后恢复」。
+  globalThis.fetch = async () => sessionsPayload([
+    sessionRow({
+      sessionId: 's-mine',
+      good: [
+        { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', at, sessionId: 's-mine', templateId: 'default', label: '硅基流动 · Alpha One' },
+      ],
+    }),
+  ], '2026-11-27', { subagentSessions: false, foreignSessions: true }, [], [
+    { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at: now, until: now + 40_000, held: false, label: '硅基流动 · Alpha One' },
+  ])
+  const realNow = Date.now
+  let first
+  let hovered
+  try {
+    const element = queue({ sessionId: 's-mine', t })
+    await fresh.mount(element)
+    first = fresh.nodes.find((node) => node.props?.['data-role'] === 'qv-limited')
+    // 时间往前走 30 秒，但**没有人**重画这一栏（没有每秒定时器）。鼠标这时候
+    // 停上去 —— 这一刻才该重新算，于是剩下 10 秒。
+    //
+    // 这个替我重画一拍的是渲染器自己的事（真浏览器里 setState 当场就重画）；
+    // 这里的 React 替身只在 mount 时走渲染循环，所以再 mount 一次。hook 按
+    // 「路径 + 组件名」复用，state 不会丢，`hoverTick` 那一拍正好接上。
+    Date.now = () => realNow() + 30_000
+    first.props.onMouseEnter()
+    await fresh.mount(element)
+    hovered = fresh.nodes.find((node) => node.props?.['data-role'] === 'qv-limited')
+  } finally {
+    Date.now = realNow
+    globalThis.fetch = saved
+  }
+
+  assert.match(String(first.props.title), /^限流中，40 秒后恢复$/, `第一拍：${first.props.title}`)
+  assert.match(String(hovered.props.title), /^限流中，10 秒后恢复$/, `悬停那一刻要重算，实际：${hovered.props.title}`)
 })
 
 await check('隔离队列：宿主没给冷却表时（新前端配旧宿主）一律还是绿的', async () => {

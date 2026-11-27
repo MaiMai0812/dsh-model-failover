@@ -435,7 +435,11 @@ window.__ModuleLoader__.load({
         qvActive: '正在用',
         qvQuarantined: '已隔离',
         qvQueued: '已验证',
-        qvLimitedHint: '上游正在限流：{text}。它没坏，只是这一会儿忙 —— 等完了自己就回到队列里，不算今天的隔离。',
+        // 悬停时直接说「还有多久」：用户停上去想知道的就是这一个数字，不必先解释
+        // 一遍什么叫限流。剩下的那句「不是隔离」放到别处说（胶囊的颜色就在说）。
+        qvLimitedInSec: '限流中，{n} 秒后恢复',
+        qvLimitedInMin: '限流中，{n} 分后恢复',
+        qvLimitedInMinSec: '限流中，{n} 分 {s} 秒后恢复',
         qvCurrent: '当前会话',
         qvRunning: '运行中',
         qvSwitching: '正在换人',
@@ -668,7 +672,9 @@ window.__ModuleLoader__.load({
         qvActive: 'In use',
         qvQuarantined: 'Quarantined',
         qvQueued: 'Verified',
-        qvLimitedHint: 'The upstream is rate limiting it — {text}. It is not broken, just busy for a moment; it rejoins the queue on its own and this is not a quarantine.',
+        qvLimitedInSec: 'Rate limited — back in {n}s',
+        qvLimitedInMin: 'Rate limited — back in {n}m',
+        qvLimitedInMinSec: 'Rate limited — back in {n}m {s}s',
         qvCurrent: 'This conversation',
         qvRunning: 'Running',
         qvSwitching: 'Switching',
@@ -2740,6 +2746,29 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * 悬停提示：「限流中，xx 分 xx 秒后恢复」。
+     *
+     * 和上面那句的区别只在**念给谁听**：那颗标签自己写着「限流，还要 25 秒」，
+     * 是铺在行里给人扫的；悬停是用户停下来专门问「还有多久」，所以第一句就得
+     * 是「几分钟后恢复」，不必再复述一遍「上游在限流、它没坏」—— 胶囊是黄的、
+     * 标签是「忙」，这些已经在说了。
+     *
+     * 分秒都补齐：`3 分 0 秒` 写成「3 分」，`0 分 20 秒` 写成「20 秒」，中间那档
+     * （越过了整分但不是整分）才两个都写。不这样写，用户会在「2 分」和「2 分
+     * 1 秒」之间来回跳，读着像在倒计时又像没在动。
+     */
+    function coolingHoverText(ms, held, t) {
+      if (held === true) return t('coolingHeld')
+      const total = Math.max(0, Math.ceil((Number.isFinite(ms) ? ms : 0) / 1000))
+      if (total < 60) return t('qvLimitedInSec', { n: total })
+      const minutes = Math.floor(total / 60)
+      const seconds = total % 60
+      return seconds === 0
+        ? t('qvLimitedInMin', { n: minutes })
+        : t('qvLimitedInMinSec', { n: minutes, s: seconds })
+    }
+
+    /**
      * 一栏里的一行会话。
      *
      * `useSessions` 由宿主以标准 hook 属性注入（dsh-client-ui-session 的
@@ -2747,7 +2776,7 @@ window.__ModuleLoader__.load({
      * 拿不到时退回会话号前缀 —— 这一栏是给人看「哪个会话出事了」，标题只是
      * 帮助识别，缺了也不能空白。
      */
-    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, onSkip, busy, onCopyError, copiedKey, nowMs, cooling }) {
+    function SessionQueueRow({ row, mine, title, t, templateName, onClear, onForget, onSkip, busy, onCopyError, copiedKey, nowMs, cooling, onHover }) {
       const quarantined = row?.quarantined ?? []
       const good = row?.good ?? []
       const active = row?.active
@@ -2970,19 +2999,33 @@ window.__ModuleLoader__.load({
                   // 「这一会儿忙不忙」—— 两件事，一颗胶囊要同时说清。
                   const cool = coolingOf(item)
                   // 剩余时间按「结束时刻 - 现在」现算，不用宿主给的 remainingMs：
-                  // 这一栏十几秒才轮询一次，拿快照里的数字会一跳一跳，而这里
-                  // 每秒都在重画（见 SessionQueue 的 nowMs 定时器）。
+                  // 那一份是上一次轮询时的快照，十几秒前的事。
                   const left = cool === undefined
                     ? 0
-                    : Math.max(0, Number(cool.until ?? 0) - Number(nowMs ?? Date.now()))
+                    : Math.max(0, Number(cool.until ?? 0) - Date.now())
                   const limited = cool !== undefined && (left > 0 || cool.held === true)
-                  const said = limited ? coolingLeftText(left, cool.held === true, t) : ''
                   return h('span', {
                     className: limited ? 'mf-qv-item mf-warn' : 'mf-qv-item mf-ok',
                     key: `${item.key ?? ''}\u0000${item.templateId ?? ''}`,
-                    // 悬停才说「还要等多久」：铺在行里会把这一栏撑得很长，而
-                    // 「它被限流了」这件事用颜色一眼就够，细节等用户想知道时再给。
-                    ...(limited ? { title: t('qvLimitedHint', { text: said }) } : {}),
+                    // 悬停才说「限流中，xx 分 xx 秒后恢复」：铺在行里会把这一栏撑得
+                    // 很长，而「它被限流了」这件事用颜色一眼就够，细节等用户想知
+                    // 道时再给。
+                    //
+                    // 这句话在**鼠标移上去的那一刻**现算一次（`onHover` 让这一行重
+                    // 画，`left` 就是那一刻的 `until - Date.now()`），所以不需要为了
+                    // 让它准确而每秒重画整个列表 —— 之前每跳一次秒都会把整栏十几颗
+                    // 胶囊连同速度、时长一起重算一遍，为了一个大多数人没停上去看的
+                    // 数字。
+                    //
+                    // 顺带解决一个旧问题：宿主下一次轮询之前，这颗胶囊可能还挂着已
+                    // 经过期的冷却。因为 `left` 是现算的，鼠标一停上去这一拍就会算
+                    // 出 0 并让它变回绿的 —— 不会出现一颗黄的写着「0 秒后恢复」。
+                    ...(limited
+                      ? {
+                          title: coolingHoverText(left, cool.held === true, t),
+                          onMouseEnter: () => onHover?.(),
+                        }
+                      : {}),
                     'data-role': limited ? 'qv-limited' : 'qv-good',
                   }, forgetButton(item, 'good'), sessionItemLabel(item), speedChip(item), timeChip(item))
                 }),
@@ -3059,24 +3102,35 @@ window.__ModuleLoader__.load({
         return table
       }, [data])
 
-      // 有没有人正被限流 —— 黄胶囊上的倒计时要一秒一跳，所以这也得驱动那个
-      // 定时器；不然用户看到的是一个停在「还要等 40 秒」不动的数字。
-      const coolingNow = cooling.size > 0
+      /**
+       * 鼠标停在黄胶囊上的那一刻，重画一次这一栏。
+       *
+       * 悬停提示里的剩余时间是**那一刻**现算的（`until - Date.now()`），而这个
+       * 计数只在有人停下来看时才需要准确：为了它每秒重画整栏十几颗胶囊（速度、
+       * 时长跟着一起重算），等于让绝大多数没在看的人陪着跳。这里改成事件驱动 ——
+       * 鼠标一移上去就 `setHoverTick`，下一拍渲染里那几个 `Date.now()` 全部落到
+       * 当下，悬停语言里那个数字也就准了。浏览器读 `title` 是在停稳之后，改完的
+       * 值赶得上。
+       */
+      const [, setHoverTick] = useState(0)
+      const onHover = useCallback(() => {
+        setHoverTick((value) => value + 1)
+      }, [])
 
       /**
-       * 正在跑的那个模型的「已用时长」要一秒一跳，被限流的那个倒计时也要。
+       * 正在跑的那个模型的「已用时长」要一秒一跳。
        *
        * 轮询最快也是几秒一次，光靠它数字会一顿一顿的，看着像卡住；这个本地
        * 定时器只负责让画面重画，时间本身是拿 `Date.now()` 现算的。
-       * 没人在跑、也没人歇着就不开 —— 这一栏大部分时间没人盯着，白跳没有意义。
+       * 没人在跑就不开 —— 这一栏大部分时间没人盯着，白跳没有意义。
        */
       const [nowMs, setNowMs] = useState(() => Date.now())
       useEffect(() => {
-        if (!running && !coolingNow) return undefined
+        if (!running) return undefined
         setNowMs(Date.now())
         const timer = setInterval(() => setNowMs(Date.now()), 1_000)
         return () => clearInterval(timer)
-      }, [running, coolingNow])
+      }, [running])
 
       useEffect(() => {
         alive.current = true
@@ -3379,6 +3433,8 @@ window.__ModuleLoader__.load({
                 copiedKey: copied,
                 nowMs,
                 cooling,
+                // 鼠标移上黄胶囊 → 重画一拍，让悬停里那个剩余时间落到「此刻」。
+                onHover,
               })),
       )
     }
