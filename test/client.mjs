@@ -2099,6 +2099,94 @@ await check('隔离队列：宿主还是老版本（占用挂在会话行上）�
   assert.ok(String(chips[0].props.title).includes('s-old'), `占着的会话号也要跟着，实际：${chips[0].props.title}`)
 })
 
+await check('隔离队列：并发限制栏里正在被限流的那个也画成黄的，并说清还有多久恢复', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 用户报的那个场景：alpha 设了上限 2，此刻一个会话都没占着（0/2）—— 因为它
+  // 正被上游限流，占着名额的会话先把座位交回去了。数字上它跟「没人用、随便来」
+  // 一模一样，只能靠颜色分开。
+  globalThis.fetch = async () => sessionsPayload(
+    [sessionRow({ sessionId: 's-mine' })],
+    '2026-11-27',
+    { subagentSessions: false, foreignSessions: true },
+    [
+      { key: KEY('alpha', 'one'), cap: 2, used: 0, holders: [], provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One' },
+      // 另一个：占满且被限流。占满只说明「这一格满了」，限流才说明「满了而且
+      // 短期好不了」，所以它该是黄的而不是红的。
+      { key: KEY('beta', 'one'), cap: 1, used: 1, holders: ['session-ccc'], provider: 'beta', model: 'one', label: 'Code99 · Beta One' },
+      // 第三个：好好的、只是空着，照旧淡一档。
+      { key: KEY('gamma', 'two'), cap: 3, used: 0, holders: [], provider: 'gamma', model: 'two', label: 'Gamma Two' },
+    ],
+    [
+      { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at, until: Date.now() + 30_000, held: false, remainingMs: 30_000, label: '硅基流动 · Alpha One' },
+      { key: KEY('beta', 'one'), provider: 'beta', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at, until: Date.now() + 125_000, held: false, remainingMs: 125_000, label: 'Code99 · Beta One' },
+    ],
+  )
+  let chips
+  let flat
+  try {
+    flat = fresh.text(await fresh.mount(queue({ sessionId: 's-mine', t })))
+    chips = roleChips('qv-cap', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+
+  const cls = (index) => String(chips[index]?.props.className ?? '')
+  assert.equal(chips.length, 3, `三条上限都要画，实际：${chips.length}`)
+
+  // 限流的那个：黄。
+  assert.equal(cls(0).includes('mf-warn'), true, `被限流的那一格要变黄，实际：${cls(0)}`)
+  assert.equal(cls(0).includes('mf-idle'), false, '限流时别再淡一档 —— 淡下去黄字也跟着变浅了')
+  assert.equal(cls(0).includes('mf-bad'), false, '它没占满，不该标红')
+  assert.equal(chips[0].props.title.includes('限流中，30 秒后恢复'), true, `悬停要说清还有多久，实际：${chips[0].props.title}`)
+  // 悬停那一刻要重画一拍，剩余时间才是当下现算的（这一栏十几秒才轮询一次）。
+  assert.equal(typeof chips[0].props.onMouseEnter, 'function', '限流那一格要挂上悬停刷新')
+  // 上限与占用数字照旧报出来 —— 颜色说的是另一件事，不能把数字挤掉。
+  assert.equal(flat.includes('0/2'), true, '数字仍要照报')
+
+  // 占满 + 限流：画黄不画红，两条信息都在悬停里。
+  assert.equal(cls(1).includes('mf-warn'), true, `占满且限流时要变黄，实际：${cls(1)}`)
+  assert.equal(cls(1).includes('mf-idle'), false)
+  assert.equal(chips[1].props.title.includes('已经占满'), true, `占满那句话要留着，实际：${chips[1].props.title}`)
+  assert.equal(chips[1].props.title.includes('限流中，2 分 5 秒后恢复'), true, `也要说清还有多久，实际：${chips[1].props.title}`)
+  assert.equal(chips[1].props.title.includes('session-ccc'), true, '占着的会话号照旧给')
+
+  // 没被限流的那格一个 `mf-warn` 都不该沾，照旧淡着。
+  assert.equal(cls(2).includes('mf-warn'), false, `没限流的别乱变黄，实际：${cls(2)}`)
+  assert.equal(cls(2).includes('mf-idle'), true, '空着且没限流的，照旧淡一档')
+  assert.equal(chips[2].props.title.includes('限流'), false, `没限流的别提限流，实际：${chips[2].props.title}`)
+  assert.equal(chips[2].props.onMouseEnter, undefined, '没限流的不用挂悬停刷新')
+})
+
+await check('隔离队列：并发限制栏里冷却到点的那一刻就变回原样，不留一颗黄的写着 0 秒', async () => {
+  const fresh = new Runtime()
+  const saved = globalThis.fetch
+  // 宿主给的是上一次轮询时的快照：`until` 已经过去了，但这一栏还没重问。
+  // 剩余时间必须现算（`until - 现在`），否则会挂着一颗写着「0 秒后恢复」的黄胶囊。
+  globalThis.fetch = async () => sessionsPayload(
+    [sessionRow({ sessionId: 's-mine' })],
+    '2026-11-27',
+    { subagentSessions: false, foreignSessions: true },
+    [
+      { key: KEY('alpha', 'one'), cap: 2, used: 0, holders: [], provider: 'alpha', model: 'one', label: '硅基流动 · Alpha One' },
+    ],
+    [
+      { key: KEY('alpha', 'one'), provider: 'alpha', model: 'one', code: 'RATE_LIMIT', message: 'slow down', at: at - 60_000, until: Date.now() - 1_000, held: false, remainingMs: 0, label: '硅基流动 · Alpha One' },
+    ],
+  )
+  let chips
+  try {
+    await fresh.mount(queue({ sessionId: 's-mine', t }))
+    chips = roleChips('qv-cap', fresh)
+  } finally {
+    globalThis.fetch = saved
+  }
+  assert.equal(chips.length, 1)
+  assert.equal(String(chips[0].props.className).includes('mf-warn'), false, '冷却已经过去了就不该还是黄的')
+  assert.equal(String(chips[0].props.className).includes('mf-idle'), true, '它回到「空着」这一档')
+  assert.equal(chips[0].props.title.includes('限流'), false, `过期的那句别提，实际：${chips[0].props.title}`)
+})
+
 // ── 首帧 / 错误态（各自一个全新的渲染器，避免和别的用例串味） ────────────────
 
 const page = sections[0].component

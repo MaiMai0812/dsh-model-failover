@@ -3388,19 +3388,44 @@ window.__ModuleLoader__.load({
                   const used = Number.isFinite(item.used) ? item.used : 0
                   const cap = Number.isFinite(item.cap) ? item.cap : 0
                   const full = cap > 0 && used >= cap
-                  const idle = used === 0
                   const holders = Array.isArray(item.holders) ? item.holders : []
+                  // 这一格的主人此刻是不是正被上游限流。
+                  //
+                  // 为什么这一栏也要管这件事：设了并发上限的模型一旦被限流，占着
+                  // 名额的那个会话会先把座位交回去（否则别的会话干等一个拿不到的
+                  // 名额），于是这一格会变成「0/2 空着」—— 看上去像「没人用，随便
+                  // 来」，实际是「上游正让它歇着，谁进来都会被顶回来」。两种处境在
+                  // 数字上长得一模一样，只能靠颜色分：跟「已验证」里那颗黄胶囊用
+                  // 同一种黄，同一个语义。
+                  const cool = cooling.get(item.key)
+                  // 剩余时间现算（`until - 现在`），不用宿主给的 `remainingMs`：
+                  // 那是上一次轮询时的快照，这一栏十几秒才问一次。
+                  const left = cool === undefined
+                    ? 0
+                    : Math.max(0, Number(cool.until ?? 0) - Date.now())
+                  const limited = cool !== undefined && (left > 0 || cool.held === true)
+                  // 被限流时不再淡一档：`mf-idle` 说的是「空着、谁来都行」，而它
+                  // 此刻恰恰是「空着，但谁进来都会被顶回来」—— 淡下去会把黄字也
+                  // 一起变浅，正好把最该看见的那条信息压没了。
+                  const idle = used === 0 && !limited
                   const base = full
                     ? t('qvCapFullHint', { used, cap })
                     : t('qvCapHint', { used, cap })
+                  const lines = [base]
+                  if (holders.length > 0) lines.push(t('qvCapHolders', { list: holders.map(fullId).join(', ') }))
+                  if (limited) lines.push(coolingHoverText(left, cool.held === true, t))
                   return span({
                     // 空着的淡一档：它确实设了上限，只是现在没人在用。
-                    className: `mf-qv-item${full ? ' mf-bad' : ''}${idle ? ' mf-idle' : ''}`,
+                    // 黄色那档写在 `mf-bad` 之后（CSS 里也在其后），所以「占满 +
+                    // 被限流」时画的是一颗黄胶囊：占满只说明「这一格满了」，限流
+                    // 才说明「满了而且短期好不了」。
+                    className: `mf-qv-item${full ? ' mf-bad' : ''}${idle ? ' mf-idle' : ''}${limited ? ' mf-warn' : ''}`,
                     key: item.key,
                     'data-role': 'qv-cap',
-                    title: holders.length === 0
-                      ? base
-                      : `${base}\n${t('qvCapHolders', { list: holders.map(fullId).join(', ') })}`,
+                    title: lines.join('\n'),
+                    // 悬停那一刻重画一拍，让上面那句「还要等多久」落到当下 ——
+                    // 这一栏靠轮询刷新，十几秒才一次，不现算就是一句过期的话。
+                    ...(limited ? { onMouseEnter: () => onHover?.() } : {}),
                   },
                     sessionItemLabel(item),
                     span({ className: 'mf-qv-code' }, ` · ${t('capLabel', { used, cap })}`),
