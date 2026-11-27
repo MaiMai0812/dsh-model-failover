@@ -148,6 +148,26 @@ finish_reason` 这一类）恰恰相反：模型已经读到上下文、也开�
 `finish_reason`」「ended without」「incomplete」这种收尾动作的，就按截断处理，照常补发。
 两条都不沾的，仍按原来的口径算本机网络 —— 宁可漏判，不要误判。
 
+**哪些失败算「忙一会儿」：认码、认协议、认写法，不认态度。** 一次限流和一次「这个模型今
+天不行」在界面上完全是两种结局（黄一会儿 vs 红一整天），所以这一刀要切得准。下面这几类都
+是**足够明确**的排队信号，一律只冷却、不进隔离名单：
+
+- HTTP 状态码 `429`。协议层说的话，适配器给什么错误码都不改变这个事实；
+- 码名里带 `rate_limit` / `throttle` 的，大小写和下划线都不计较 —— `RATE_LIMIT`、
+  `rate_limit_exceeded`、`bili_throttle_hold`、`bili_throttle_terminal` 都算。最后两个是
+  bili 出站闸门自己的码：上游在排队时它先攒着不发，到点自动放开（`hold`），连撞太多次就
+  干脆歇一会儿（`terminal`）—— 文案里未必再复述一遍 `rate-limited`，光看码就该认出来；
+- 报错文本里的 `rate limit` / `rate-limited` / `rate_limit_error` / `throttled` /
+  `Too Many Requests` / `429`，以及 `concurrency limit`（Anthropic 与不少中转说「账号并发
+  满了」就是这么写的）；
+- gRPC 的 `RESOURCE_EXHAUSTED`（就是 429 的等价物），以及结构化字段里的
+  `"type":"overloaded_error"`。
+
+反过来，**裸的 `overloaded` / `capacity full` 故意不收**。线上真正见到的写法是 Cloudflare
+的 502/504 说明页，正文写着「the origin is overloaded or misconfigured」，那是网关坏了；
+还有中转自报的「system disk overloaded (99.1%)」。按裸词收下来，等于把所有 5xx 都改成冷
+却，隔离名单形同虚设 —— 宁可漏判，不要误判。
+
 **上下文装不下：先找窗口更大的接着写，实在没有才交回宿主压缩。** 队里某个候选的窗口装
 不下这一轮，就把这一轮交给排在后面、**窗口更大**的那个候选接着写 —— 上下文一字不动，用户
 看到的就是「它继续说」，而不是「会话弹个错然后什么都得重新来」。换人这件事只在事件日志

@@ -1933,6 +1933,27 @@ await check('限流：冷却不分会话 —— 限流是上游账号的事，�
   assert.deepEqual(touched, [routeKey('beta', 'one')], `冷却该跨会话生效：${JSON.stringify(touched)}`)
 })
 
+await check('限流：bili 的 throttle 码（没有 rate-limited 那句话）也算冷却，不隔离', async () => {
+  // 用户 2026-11-27 报的那条的**裸形态**：只有 bili 自己的码，message 里不再
+  // 复述一句 `rate-limited`。以前这种会被判成「模型今天坏了」隔离到明天。
+  const holdKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [holdKey, failing('bili_throttle_hold', '{"type":"rate_limit_error","code":"bili_throttle_hold","retryable":true}')],
+      [routeKey('beta', 'one'), ok('换人写完了')],
+    ]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('跑一下')], sessionId: 's1' }))
+  assert.equal(textOf(chunks), '换人写完了', '被闸门挡住的那个让开，下一个接上')
+  assert.deepEqual(h.health.view(h.clock.ms, 1).quarantined, [], '这是一次排队，不是「今天出不了东西」')
+  assert.equal(h.cooldowns.has(holdKey), true, '该进冷却表')
+  assert.equal(h.events.some((event) => event.kind === 'quarantine'), false, '一条 quarantine 都不该有')
+  const row = h.events.find((event) => event.kind === 'cooldown')
+  assert.equal(row.code, 'bili_throttle_hold', '事件里保留上游原来的码，别改写成 RATE_LIMIT')
+})
+
 await check('限流判据：只看明确的限流信号，502 / 超时 / 网络中断都不算', async () => {
   const { isTransientFailure, retryAfterFromMessage } = await import('../lib/cooldown.js')
 
@@ -1962,6 +1983,55 @@ await check('限流判据：只看明确的限流信号，502 / 超时 / 网络�
   assert.equal(retryAfterFromMessage('try again in 1500 ms', now), 1_500)
   assert.equal(retryAfterFromMessage('slow down (~5s)', now), 5_000)
   assert.equal(retryAfterFromMessage('too many requests', now), undefined, '没写时间就不猜')
+})
+
+await check('限流判据：429 与 bili 的 throttle 码算「忙」，不是「坏」', async () => {
+  const { isTransientFailure } = await import('../lib/cooldown.js')
+
+  // 用户 2026-11-27 报的那条原样贴进来。它在线上是以 `code=RATE_LIMIT` 到达的，
+  // 但同一句话也可能只带 bili 自己的码 —— 两种都得认。
+  const real = '429: {"type":"rate_limit_error","code":"bili_throttle_hold","stage":"forward","message":"upstream rate-limited 2 consecutive request(s) to api.203236.xyz; bili is holding outbound sends until 2026-11-27T14:08:20.713Z (~1s, exponential backoff) instead of amplifying — zero egress while held, auto-resumes when the limit clears (#4204)","retryable":true}'
+  assert.equal(isTransientFailure({ code: 'RATE_LIMIT', message: real }), true)
+
+  // 只有码、没有那句 `rate-limited` 的形态：光看码名的词根就得认出来。
+  assert.equal(isTransientFailure({ code: 'bili_throttle_hold' }), true, '小写码也要认')
+  assert.equal(isTransientFailure({ code: 'BILI_THROTTLE_HOLD' }), true)
+  assert.equal(isTransientFailure({ code: 'bili_throttle_terminal' }), true)
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: 'bili_throttle_hold: holding outbound sends (~1s)' }), true)
+
+  // 下划线形态：`_` 是词字符，旧判据的 `\b` 收尾在这类标准文案上根本不成立。
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: '{"type":"rate_limit_error"}' }), true)
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: 'rate_limit_exceeded' }), true)
+  assert.equal(isTransientFailure({ code: 'RATE_LIMITED' }), true)
+  assert.equal(isTransientFailure({ code: 'TOO_MANY_REQUESTS' }), true)
+
+  // 协议级等价物与两种「账号满了」。
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: 'RESOURCE_EXHAUSTED: quota' }), true, 'gRPC 的 429')
+  assert.equal(isTransientFailure({ code: 'SERVER', message: '529: {"type":"overloaded_error","code":"overloaded"}' }), true)
+  assert.equal(
+    isTransientFailure({ code: 'PI_AI_ERROR', message: 'This account has reached its concurrency limit (4). In-flight requests: 4. Please retry later' }),
+    true,
+  )
+
+  // HTTP 层说了 429 就是 429，适配器给什么码都不改这个事实。
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: 'upstream said no', status: 429 }), true)
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', message: 'upstream said no', status: '429' }), true, '状态码有时是字符串')
+
+  // 反例：这些文本里也常出现「忙」的字眼，但线上真正见到的是网关坏了 / 磁盘打满。
+  // 按文本一概收下来，等于把所有 5xx 都改成冷却，隔离名单形同虚设。
+  assert.equal(
+    isTransientFailure({ code: 'SERVER', message: '502 {"title":"Error 502: Bad gateway","detail":"The origin web server returned an invalid or incomplete response to Cloudflare. This typically indicates the origin is overloaded or misconfigured."}' }),
+    false,
+    'Cloudflare 说明页里的 overloaded 不算',
+  )
+  assert.equal(
+    isTransientFailure({ code: 'SERVER', message: '503: {"message":"system disk overloaded (current: 99.1%, threshold: 98%)","type":"new_api_error"}' }),
+    false,
+    '中转自报磁盘打满不算',
+  )
+  assert.equal(isTransientFailure({ code: 'SERVER', message: '503: {"message":"all accounts are temporarily unavailable, please retry later"}' }), false)
+  assert.equal(isTransientFailure({ code: 'INVALID_CREDENTIAL', message: 'invalid api key' }), false)
+  assert.equal(isTransientFailure({ code: 'UNKNOWN', status: 500, message: 'internal error' }), false)
 })
 
 await check('并发上限：0 / 小数 / 负数都当「没设」，超过 16 收到 16', async () => {
