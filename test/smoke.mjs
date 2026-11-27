@@ -120,6 +120,20 @@ const transportFail = () => async function* () {
   yield { type: 'finish', reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'trae: transport error' } } }
 }
 
+/**
+ * 话说到一半，上游把连接掐了 —— 逐字抄自 2026-11-27 的事件日志。
+ *
+ * 关键在于它的 code 也是 `TRANSPORT`，但**不是**本机网络问题：请求已经送到、
+ * 模型已经开始输出，只是没等到收尾。这种失败正是「继续」能救回来的，早先因为
+ * 只看 code 被判成本机网络，补发一次都没发生。
+ */
+const streamCut = () => async function* () {
+  yield {
+    type: 'finish',
+    reason: { kind: 'error', failure: { code: 'TRANSPORT', message: 'Stream ended without finish_reason' } },
+  }
+}
+
 /** 远端 5xx：不是本机网络问题，该照常带「继续」重试。 */
 const upstream5xx = () => async function* () {
   yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'upstream returned 502 Bad Gateway' } } }
@@ -1003,6 +1017,26 @@ await check('链路层错误码（TRANSPORT）：同样不带「继续」', asyn
   for (const call of h.llm.calls) {
     assert.equal(lastUserText(call.messages), '写一首诗', `${call.key} 不该带「继续」`)
   }
+})
+
+// 5d · 话说到一半被掐断：这不是本机网络，换人那一跳要带「继续」
+await check('流没正常收尾（code 也是 TRANSPORT）：换人时带上「继续」', async () => {
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [routeKey('alpha', 'one'), streamCut()],
+      [routeKey('beta', 'one'), ok('接着写完了')],
+    ]),
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'auto', messages: [user('写一首诗')] }))
+  assert.equal(textOf(chunks), '接着写完了')
+
+  const last = h.llm.calls[h.llm.calls.length - 1]
+  assert.equal(last.key, routeKey('beta', 'one'), '该换到下一个候选')
+  assert.equal(lastUserText(last.messages), '继续', '流被掐断后换人，要带「继续」接上下文')
+  // 同一个模型的原样重发仍旧不带「继续」—— 半句话都没有，没什么可接的。
+  assert.equal(lastUserText(h.llm.calls[0].messages), '写一首诗', '同模型重发要原样')
 })
 
 await check('远端 5xx 照旧会被重试 —— 网络判据不能把该救的失败一起摁掉', async () => {

@@ -17,7 +17,7 @@ process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'model-failover-auto-'))
 
 const { AutoContinue, autoContinueTrigger, autoContinueLimitFor, continueUserMessage, AUTO_CONTINUE_SKIP_CODES } =
   await import('../lib/autocontinue.js')
-const { LOCAL_NETWORK_CODES, isLocalNetworkFailure } = await import('../lib/network.js')
+const { LOCAL_NETWORK_CODES, isLocalNetworkFailure, looksLikeTruncatedStream } = await import('../lib/network.js')
 const { TurnNotes } = await import('../lib/notes.js')
 const { DEFAULT_SETTINGS } = await import('../lib/constants.js')
 const { normalizeSettings } = await import('../index.js')
@@ -156,6 +156,34 @@ await check('链路层错误码（TRANSPORT）→ 不触发', () => {
       `${code} 不该触发补发`,
     )
   }
+})
+
+await check('同一个 TRANSPORT 也可能是「话说到一半被掐断」→ 要补发', () => {
+  // 逐字抄自 2026-11-27 的事件日志：这条被当成本机网络跳过过一次补发。
+  const failure = { code: 'TRANSPORT', message: 'Stream ended without finish_reason' }
+  assert.equal(looksLikeTruncatedStream(failure.message), true)
+  assert.equal(isLocalNetworkFailure(failure), false, '请求已经送到了，不是本机网络')
+  assert.equal(autoContinueTrigger({ kind: 'error', error: failure }, settingsOf()), 'error', '要补发「继续」')
+
+  // 其它几种「没正常收尾」的写法也要认。
+  for (const message of [
+    'pi-ai event stream ended without done/error',
+    'stream ended before a finish chunk arrived',
+    'upstream closed before the answer completed',
+    'response incomplete: no finish_reason',
+  ]) {
+    assert.equal(isLocalNetworkFailure({ code: 'TRANSPORT', message }), false, `不该判为本机网络：${message}`)
+    assert.equal(
+      autoContinueTrigger({ kind: 'error', error: { code: 'TRANSPORT', message } }, settingsOf()),
+      'error',
+      `应该补发：${message}`,
+    )
+  }
+
+  // 但「硬证据」优先：同时写着 fetch failed 的，仍旧是本机网络 —— 请求根本没出去。
+  const both = { code: 'TRANSPORT', message: 'fetch failed: stream ended without finish_reason' }
+  assert.equal(isLocalNetworkFailure(both), true, '有 fetch failed 就是本机网络')
+  assert.equal(autoContinueTrigger({ kind: 'error', error: both }, settingsOf()), undefined, '仍不补发')
 })
 
 await check('TIMEOUT 不算本机网络 —— 握手都成功了，更像远端太慢', () => {
