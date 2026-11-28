@@ -134,6 +134,23 @@ const streamCut = () => async function* () {
   }
 }
 
+/**
+ * 同一个毛病的另一种说法 —— 逐字抄自 2026-11-28 的事件日志（用户报的那条）。
+ *
+ * 「没等到 completion event」与上面那句是同一件事：话说了一半被掐断。区别只在
+ * 措辞，所以两者的处置也必须一致（冷却、补发「继续」），不能一个当限流、另一个
+ * 当「模型今天坏了」。
+ */
+const streamCutCompletion = () => async function* () {
+  yield {
+    type: 'finish',
+    reason: {
+      kind: 'error',
+      failure: { code: 'TRANSPORT', message: 'upstream stream ended before a completion event; this turn may be incomplete' },
+    },
+  }
+}
+
 /** 远端 5xx：不是本机网络问题，该照常带「继续」重试。 */
 const upstream5xx = () => async function* () {
   yield { type: 'finish', reason: { kind: 'error', failure: { code: 'SERVER', message: 'upstream returned 502 Bad Gateway' } } }
@@ -1037,6 +1054,34 @@ await check('流没正常收尾（code 也是 TRANSPORT）：换人时带上「�
   assert.equal(lastUserText(last.messages), '继续', '流被掐断后换人，要带「继续」接上下文')
   // 同一个模型的原样重发仍旧不带「继续」—— 半句话都没有，没什么可接的。
   assert.equal(lastUserText(h.llm.calls[0].messages), '写一首诗', '同模型重发要原样')
+})
+
+await check('流没等到 completion event：算限流歇一会儿，不隔离一整天', async () => {
+  // 2026-11-28 用户报的那条，逐字：code 是 TRANSPORT，文案说的是「话说到一半
+  // 被掐断」。以前它落进隔离分支，这个模型当天就不再被用了；而它其实只是这一趟
+  // 没写完 —— 歇一会儿、重发一趟多半就能接上。
+  const alphaKey = routeKey('alpha', 'one')
+  const h = await harness({
+    order: [{ provider: 'alpha', model: 'one' }, { provider: 'beta', model: 'one' }],
+    scripts: new Map([
+      [alphaKey, streamCutCompletion()],
+      [routeKey('beta', 'one'), ok('换人接着写完了')],
+    ]),
+    settings: { cooldownSec: 45 },
+  })
+
+  const chunks = await drain(h.adapter.stream({ provider: ROUTE, model: 'default', messages: [user('写一首诗')], sessionId: 's1' }))
+  assert.equal(textOf(chunks), '换人接着写完了', '被掐断的那个让开，下一个接上')
+  assert.deepEqual(h.health.view(h.clock.ms, 1).quarantined, [], '这不该记成「今天出不了东西」')
+  assert.equal(h.cooldowns.has(alphaKey), true, '该进冷却表')
+  const remaining = h.cooldowns.remaining(alphaKey)
+  assert.ok(remaining > 40_000 && remaining <= 45_000, `冷却时长该用设置页那个值（45 秒），实际 ${remaining}ms`)
+  assert.equal(h.events.some((event) => event.kind === 'quarantine'), false, '一条 quarantine 都不该有')
+  const row = h.events.find((event) => event.kind === 'cooldown')
+  assert.equal(row.code, 'TRANSPORT', '事件里保留上游原来的码，别改写成 RATE_LIMIT')
+  // 换人那一跳要带「继续」：半句话已经说出去了，得接上下文。
+  const last = h.llm.calls[h.llm.calls.length - 1]
+  assert.equal(lastUserText(last.messages), '继续', '掐断之后换人，要带「继续」')
 })
 
 await check('远端 5xx 照旧会被重试 —— 网络判据不能把该救的失败一起摁掉', async () => {
@@ -1964,6 +2009,19 @@ await check('限流判据：只看明确的限流信号，502 / 超时 / 网络�
   assert.equal(isTransientFailure({ code: 'SERVER', message: 'HTTP 429' }), true)
   assert.equal(isTransientFailure({ code: 'SERVER', message: 'request throttled, slow down' }), true)
 
+  // 「流没正常收尾」也算「过一会儿自己会好」—— 话说到一半被掐断，重发一趟
+  // 多半就能接上，没道理让它今天一整天不再被使用。两种说法都要认。
+  assert.equal(
+    isTransientFailure({ code: 'TRANSPORT', message: 'upstream stream ended before a completion event; this turn may be incomplete' }),
+    true,
+    '没等到 completion event（2026-11-28 用户报的那条）',
+  )
+  assert.equal(
+    isTransientFailure({ code: 'TRANSPORT', message: 'Stream ended without finish_reason' }),
+    true,
+    '没拿到 finish_reason（同一毛病的另一种说法）',
+  )
+
   // 不该算的：这些是「真出问题」或「本机网络」，冷却它们会让队列反复撞同一堵墙。
   assert.equal(isTransientFailure({ code: 'SERVER', message: 'upstream returned 502 Bad Gateway' }), false)
   assert.equal(isTransientFailure({ code: 'TIMEOUT', message: 'request timed out after 300s' }), false)
@@ -1971,6 +2029,16 @@ await check('限流判据：只看明确的限流信号，502 / 超时 / 网络�
   assert.equal(isTransientFailure({ code: 'QUOTA', message: 'insufficient balance' }), false)
   assert.equal(isTransientFailure({ code: 'EMPTY_RESPONSE' }), false)
   assert.equal(isTransientFailure(undefined), false)
+  // Cloudflare 的 502 说明页正文就写着 "invalid or incomplete response" —— 那是
+  // 网关坏了，不是模型的话说到一半被掐断。只认强证据就是为了挡住这一条。
+  assert.equal(
+    isTransientFailure({
+      code: 'SERVER',
+      message: '502 {"detail":"The origin web server returned an invalid or incomplete response to Cloudflare."}',
+    }),
+    false,
+    '网关的「响应不完整」不是模型的「话没说完」',
+  )
 
   // 从文本里读「什么时候再来」。
   const now = Date.parse('2026-11-04T08:44:40.000Z')

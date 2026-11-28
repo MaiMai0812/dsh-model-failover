@@ -168,12 +168,21 @@ finish_reason` 这一类）恰恰相反：模型已经读到上下文、也开�
   `Too Many Requests` / `429`，以及 `concurrency limit`（Anthropic 与不少中转说「账号并发
   满了」就是这么写的）；
 - gRPC 的 `RESOURCE_EXHAUSTED`（就是 429 的等价物），以及结构化字段里的
-  `"type":"overloaded_error"`。
+  `"type":"overloaded_error"`；
+- **流没正常收尾**：`finish_reason`、`ended without`、`stream ended`、`completion event`
+  这类点名「收尾动作」的原话。请求明明送到了、模型也读懂上下文了，只是话没说完就被掐断
+  —— 换一趟重发多半就能接上，没有理由让它今天一整天不再被使用。这条与上面「话说到一半
+  被掐断要补发」用的是同一份判据，两处对「截断」的定义永远一致。
 
 反过来，**裸的 `overloaded` / `capacity full` 故意不收**。线上真正见到的写法是 Cloudflare
 的 502/504 说明页，正文写着「the origin is overloaded or misconfigured」，那是网关坏了；
 还有中转自报的「system disk overloaded (99.1%)」。按裸词收下来，等于把所有 5xx 都改成冷
 却，隔离名单形同虚设 —— 宁可漏判，不要误判。
+
+「流没正常收尾」这一档同理，只认**强**证据（点名收尾动作的那些词），不认裸的
+`incomplete` / `truncated`：Cloudflare 的 502 说明页正文就写着「returned an invalid or
+incomplete response」，拿它去冷却等于把 5xx 一律改成「歇一会儿」。判错这一档的代价是
+「本来今天能用的模型被踢出队列」，所以宁可收窄。
 
 **上下文装不下：先找窗口更大的接着写，实在没有才交回宿主压缩。** 队里某个候选的窗口装
 不下这一轮，就把这一轮交给排在后面、**窗口更大**的那个候选接着写 —— 上下文一字不动，用户
